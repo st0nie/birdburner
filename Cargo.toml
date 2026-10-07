@@ -1,0 +1,36 @@
+[package]
+name = "birdburner"
+version = "0.1.0"
+edition = "2024"
+default-run = "birdburner"
+
+[dependencies]
+esp-hal = { version = "=1.0.0", features = ["esp32c6", "unstable"] }
+esp-radio = { version = "=0.17.0", default-features = false, features = ["esp32c6", "wifi", "unstable"] }
+esp-rtos = { version = "=0.2.0", features = ["esp32c6", "esp-radio", "embassy"] }
+esp-alloc = { version = "=0.9.0", features = ["esp32c6"] }
+esp-println = { version = "=0.15.0", default-features = false, features = ["esp32c6", "uart", "colors", "critical-section"] }
+esp-bootloader-esp-idf = { version = "=0.4.0", features = ["esp32c6"] }
+
+esp-wifi-sys = { version = "=0.8.1", features = ["esp32c6"] }
+ssd1306 = { version = "0.10", default-features = false, features = ["graphics"] }
+embedded-graphics = "0.8"
+critical-section = "1.2"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+picoserve = { version = "=0.20.1", features = ["embassy", "json", "alloc"] }
+embassy-net = { version = "0.9", features = ["tcp", "dhcpv4", "proto-ipv4", "medium-ethernet"] }
+embassy-executor = "0.9"
+embassy-time = "0.5"
+embassy-sync = "0.7"
+static_cell = "2.1"
+esp-storage = { version = "=0.7.0", features = ["esp32c6"] }
+embedded-storage = "0.3.1"
+
+[profile.release]
+opt-level = "s"
+debug = 2
+
+[profile.dev]
+opt-level = "s"

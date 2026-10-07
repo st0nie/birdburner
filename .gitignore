@@ -1,0 +1,9 @@
+/target
+/.pi
+
+# realmem: share project memories (.pi/realmem) through git
+!/.pi/
+/.pi/*
+!/.pi/realmem/
+!/.pi/realmem/**
+/src/secrets.rs

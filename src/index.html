@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bird Cage Heater</title>
+<style>
+  :root { color-scheme: light dark; --ok:#1a7f37; --warn:#b26a00; --bad:#c62828; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; max-width: 480px; margin-inline: auto; }
+  h1 { font-size: 1.2rem; margin: 0 0 12px; }
+  .card { border: 1px solid #8884; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  .temp { font-size: 3rem; font-weight: 700; line-height: 1.1; }
+  .muted { opacity: .7; font-size: .9rem; }
+  .row { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; }
+  .badge { padding: 2px 10px; border-radius: 999px; color: #fff; font-weight: 600; font-size: .85rem; }
+  .ok { background: var(--ok); } .warn { background: var(--warn); } .bad { background: var(--bad); }
+  input[type=range] { width: 100%; height: 36px; }
+  .target { font-size: 1.6rem; font-weight: 700; text-align: center; }
+  button { font-size: 1rem; padding: 12px; border-radius: 10px; border: 0; width: 100%; margin-top: 8px; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .start { background: var(--ok); color: #fff; } .stop { background: var(--bad); color: #fff; }
+  #msg { min-height: 1.2em; font-size: .9rem; }
+  #msg.err { color: var(--bad); }
+</style>
+</head>
+<body>
+<h1>Bird Cage Heater <span id="conn" class="badge warn">Connecting</span></h1>
+
+<div class="card">
+  <div class="muted">Cage temperature (centre probe)</div>
+  <div class="temp" id="temp">--.--</div>
+  <div class="muted" id="tempnote"></div>
+</div>
+
+<div class="card">
+  <div class="muted">Target temperature</div>
+  <div class="target"><span id="tgtv">--</span> °C</div>
+  <input id="tgt" type="range" min="15" max="30" step="0.5" aria-label="Target temperature">
+  <div class="row muted"><span>15</span><span>30</span></div>
+</div>
+
+<div class="card">
+  <div class="row"><span>Status</span><span id="mode" class="badge warn">--</span></div>
+  <div class="row"><span>Heater output</span><span id="duty">--</span></div>
+  <div class="row"><span>SSR</span><span id="ssr">--</span></div>
+  <div class="row"><span>Fault</span><span id="fault">none</span></div>
+  <div class="row muted"><span>Sampling</span><span id="hz">--</span></div>
+  <button id="start" class="start">Start heating</button>
+  <button id="stop" class="stop">Stop heating</button>
+  <div id="msg" role="status" aria-live="polite"></div>
+</div>
+
+<div class="card">
+  <div class="muted">Max heater power (100 W × percent)</div>
+  <div class="target"><span id="outv">--</span> %</div>
+  <input id="out" type="range" min="10" max="100" step="5" aria-label="Max heater power">
+  <div class="row muted"><span>10%</span><span>100%</span></div>
+  <div class="muted">Raise it if warm-up is slow; lower it when the cover is on and the cage holds heat well.</div>
+</div>
+
+<div class="card">
+  <div class="muted">Safety limit (cuts power at the limit, resumes 3 °C below it)</div>
+  <div class="target"><span id="maxv">--</span> °C</div>
+  <input id="max" type="range" min="25" max="40" step="0.5" aria-label="Safety limit">
+  <div class="row muted"><span>25</span><span>40</span></div>
+  <div class="muted">Must stay at least 2 °C above the target.</div>
+</div>
+
+<p class="muted">Target, max power, safety limit and on/off intent are saved. All faults recover automatically: sensor errors after 3 good windows, over-temperature once 3 °C below the limit; after a power cut it also waits for 3 good readings. Software cannot replace an independent thermal cutout.</p>
+
+<script>
+const $ = id => document.getElementById(id);
+const MODE = { pid: ['Heating','ok'], standby: ['Standby','warn'], stopped: ['Stopped','warn'], fault: ['Fault','bad'] };
+const FAULT = { sensor_error: 'Probe read error', sensor_stale: 'Probe timed out', invalid_sample: 'Invalid reading',
+  over_temperature: 'Over safety limit (resumes 3 °C below it)', invalid_config: 'Configuration error' };
+const BLOCK = { safety_not_configured: 'Safety limit not configured', sensor_not_ready: 'Waiting for a valid reading',
+  over_temperature: 'Too close to the safety limit', invalid_config: 'Configuration error' };
+let dragging = { tgt: false, max: false, out: false }, last = null;
+
+function say(text, err) { $('msg').textContent = text || ''; $('msg').className = err ? 'err' : ''; }
+
+function render(s) {
+  last = s;
+  $('conn').textContent = 'Connected'; $('conn').className = 'badge ok';
+  $('temp').textContent = s.display.replace(' C', ' °C');
+  $('tempnote').textContent = s.sensor === 'error'
+    ? `${s.consecutive_sensor_errors} consecutive 5 s windows without a valid reading (* = last good value)` : 'Average of all good reads within 5 s';
+  if (!dragging.tgt) { $('tgt').value = s.target_c; $('tgtv').textContent = s.target_c.toFixed(1); }
+  if (!dragging.out) { $('out').value = s.max_output_pct; $('outv').textContent = s.max_output_pct; }
+  if (!dragging.max && s.max_temperature_c != null) { $('max').value = s.max_temperature_c; $('maxv').textContent = s.max_temperature_c.toFixed(1); }
+  const [label, cls] = MODE[s.mode] || [s.mode, 'warn'];
+  let modeText = label;
+  if ((s.mode === 'fault' || s.mode === 'standby') && s.desired_enabled) modeText += ` (recovering ${s.recovery_samples}/3)`;
+  $('mode').textContent = modeText; $('mode').className = 'badge ' + cls;
+  const pid = s.pid_output_pct == null ? '—' : s.pid_output_pct.toFixed(1) + '%';
+  $('duty').textContent = `${s.commanded_duty_pct.toFixed(0)}% ≈ ${s.commanded_duty_pct.toFixed(0)} W (PID ${pid}, cap ${s.max_output_pct}%)`;
+  $('ssr').textContent = s.ssr_command === 'Closed' ? 'energised' : 'open';
+  $('fault').textContent = s.fault ? (FAULT[s.fault] || s.fault) : 'none';
+  const tot = s.window_ok_reads + s.window_failed_reads;
+  $('hz').textContent = `last window ${s.window_ok_reads}/${tot} reads ok` + (s.storage_ok ? '' : ' · save failed!');
+  $('start').disabled = s.pid_enabled || !!s.start_blocked_by;
+  $('start').title = s.start_blocked_by ? (BLOCK[s.start_blocked_by] || s.start_blocked_by) : '';
+  if (s.start_blocked_by && !s.pid_enabled && !$('msg').textContent)
+    say('Cannot start: ' + (BLOCK[s.start_blocked_by] || s.start_blocked_by));
+}
+
+async function call(path, body) {
+  const opt = { method: body === undefined ? 'GET' : 'POST', cache: 'no-store' };
+  if (body !== undefined && body !== null) { opt.headers = { 'Content-Type': 'application/json' }; opt.body = JSON.stringify(body); }
+  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 4000);
+  try {
+    let r;
+    try { r = await fetch(path, { ...opt, signal: ctrl.signal }); }
+    catch (e) { // device briefly busy closing a socket: retry once (all endpoints are idempotent)
+      await new Promise(ok => setTimeout(ok, 300));
+      r = await fetch(path, { ...opt, signal: ctrl.signal });
+    }
+    const j = await r.json();
+    if (!r.ok) throw new Error(BLOCK[j.error] || j.error || r.status);
+    return j;
+  } finally { clearTimeout(t); }
+}
+
+async function poll() {
+  try { render(await call('/api/status')); }
+  catch { $('conn').textContent = 'Offline'; $('conn').className = 'badge bad'; }
+  finally { setTimeout(poll, 1500); }
+}
+
+async function act(path, body, okText) {
+  say('');
+  try { render(await call(path, body)); say(okText); }
+  catch (e) { const m = String(e.message || e); say(ERR[m] || m, true); }
+}
+
+const ERR = { target_too_close_to_safety_limit: 'Target must stay at least 2 °C below the safety limit',
+  limit_must_be_at_least_target_plus_2: 'Safety limit must be at least 2 °C above the target' };
+function slider(id, label, path, key, okText, digits = 1) {
+  const el = $(id);
+  el.addEventListener('input', () => { dragging[id] = true; $(label).textContent = Number(el.value).toFixed(digits); });
+  el.addEventListener('change', async () => {
+    await act(path, { [key]: Number(el.value) }, okText);
+    dragging[id] = false;
+    if (last) render(last); // snap back if the device rejected the value
+  });
+}
+slider('tgt', 'tgtv', '/api/target', 'target_c', 'Target saved');
+slider('max', 'maxv', '/api/limit', 'max_temperature_c', 'Safety limit saved');
+slider('out', 'outv', '/api/max_output', 'max_output_pct', 'Max power saved', 0);
+$('start').onclick = () => act('/api/start', null, 'Started; waiting for a fresh reading');
+$('stop').onclick = () => act('/api/stop', null, 'Stopped');
+poll();
+</script>
+</body>
+</html>
