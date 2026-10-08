@@ -1,9 +1,13 @@
 //! Single externally powered DS18B20; conversion waiting never blocks WiFi.
+//!
+//! The probe's VDD comes from a GPIO, not from the 3.3 V rail. A probe that latches up keeps
+//! answering on the bus but never converts again, and no 1-Wire command can clear that: only
+//! removing VDD can. `power_off` / `power_on` let the sensor task do exactly that.
 
 use crate::ds18b20_data::{DataError, temperature_millicelsius, validate_crc};
 use esp_hal::{
     delay::Delay,
-    gpio::{DriveMode, Flex, OutputConfig, Pull},
+    gpio::{DriveMode, Flex, Output, OutputConfig, Pull},
     time::Instant,
 };
 
@@ -39,10 +43,10 @@ impl core::fmt::Display for SensorError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::BusStuckLow => f.write_str("bus stuck LOW; check short/pull-up"),
-            Self::NoPresence => f.write_str("no presence; check DATA, VDD, GND, 4.7k pull-up"),
+            Self::NoPresence => f.write_str("no presence; check DATA (GPIO23), VDD (GPIO22), GND, 4.7k pull-up"),
             Self::Data(error) => write!(f, "{:?}", error),
             Self::WrongFamily(family) => write!(f, "wrong family 0x{:02x}, expected 0x28", family),
-            Self::ParasitePowerUnsupported => f.write_str("parasite power unsupported; connect VDD=3.3V"),
+            Self::ParasitePowerUnsupported => f.write_str("parasite power unsupported; connect VDD to GPIO22 (3.3V when on)"),
             Self::ConversionTimeout => f.write_str("12-bit conversion timeout (>1000ms)"),
             Self::NotConverting => f.write_str("no conversion started"),
             Self::ResolutionMismatch => f.write_str("sensor lost 12-bit configuration; reinitializing"),
@@ -59,13 +63,17 @@ const SCRATCHPAD_RETRIES: usize = 2;
 
 pub struct Ds18b20<'d> {
     pin: Flex<'d>,
+    /// Probe VDD. Held high; dropped only to power-cycle a probe that stopped converting.
+    power: Output<'d>,
     delay: Delay,
     conversion_started: Option<Instant>,
     configured_rom: Option<[u8; 8]>,
 }
 
 impl<'d> Ds18b20<'d> {
-    pub fn new(mut pin: Flex<'d>) -> Self {
+    /// `pin` is DATA, `power` drives the probe's VDD (it is switched on here).
+    pub fn new(mut pin: Flex<'d>, mut power: Output<'d>) -> Self {
+        power.set_high();
         pin.set_high();
         pin.apply_output_config(
             &OutputConfig::default()
@@ -74,7 +82,28 @@ impl<'d> Ds18b20<'d> {
         );
         pin.set_input_enable(true);
         pin.set_output_enable(true);
-        Self { pin, delay: Delay::new(), conversion_started: None, configured_rom: None }
+        Self { pin, power, delay: Delay::new(), conversion_started: None, configured_rom: None }
+    }
+
+    /// Cut the probe's power. DATA is pulled low first and stays low: with DATA released, the
+    /// pull-ups would feed the chip through its input protection diode and a latched-up probe
+    /// would never lose power. Forgets the 12-bit configuration; the next conversion re-inits.
+    pub fn power_off(&mut self) {
+        self.conversion_started = None;
+        self.configured_rom = None;
+        self.pin.set_low();
+        self.power.set_low();
+    }
+
+    /// Restore the probe's power. DATA stays low until `release_data`, so the pull-ups do not
+    /// race the supply ramp.
+    pub fn power_on(&mut self) {
+        self.power.set_high();
+    }
+
+    /// Let DATA float high again (open drain, pulled up) once VDD is stable.
+    pub fn release_data(&mut self) {
+        self.pin.set_high();
     }
 
     fn reset(&mut self) -> Result<(), SensorError> {

@@ -66,12 +66,12 @@
   <div class="muted">Must stay at least 2 °C above the target.</div>
 </div>
 
-<p class="muted">Target, max power, safety limit and on/off intent are saved. All faults recover automatically: sensor errors after 3 good windows, over-temperature once 3 °C below the limit; after a power cut it also waits for 3 good readings. Software cannot replace an independent thermal cutout.</p>
+<p class="muted">Target, max power, safety limit and on/off intent are saved. A probe that stops answering is power-cycled first (not a fault unless 3 resets fail). All faults recover automatically: sensor errors once the probe answers and 3 good windows follow, over-temperature once 3 °C below the limit; after a power cut it also waits for 3 good readings. Software cannot replace an independent thermal cutout.</p>
 
 <script>
 const $ = id => document.getElementById(id);
 const MODE = { pid: ['Heating','ok'], standby: ['Standby','warn'], stopped: ['Stopped','warn'], fault: ['Fault','bad'] };
-const FAULT = { sensor_error: 'Probe read error', sensor_stale: 'Probe timed out', invalid_sample: 'Invalid reading',
+const FAULT = { sensor_error: 'Probe not answering (3 power resets failed; retrying every minute)', sensor_stale: 'Probe timed out', invalid_sample: 'Invalid reading',
   over_temperature: 'Over safety limit (resumes 3 °C below it)', invalid_config: 'Configuration error' };
 const BLOCK = { safety_not_configured: 'Safety limit not configured', sensor_not_ready: 'Waiting for a valid reading',
   over_temperature: 'Too close to the safety limit', invalid_config: 'Configuration error' };
@@ -83,14 +83,17 @@ function render(s) {
   last = s;
   $('conn').textContent = 'Connected'; $('conn').className = 'badge ok';
   $('temp').textContent = s.display.replace(' C', ' °C');
-  $('tempnote').textContent = s.sensor === 'error'
+  $('tempnote').textContent = s.sensor === 'resetting'
+    ? `Probe stopped answering: power-cycling it (reset ${s.sensor_reset_attempt}/3), heater held off (* = last good value)`
+    : s.sensor === 'error'
     ? `${s.consecutive_sensor_errors} consecutive 5 s windows without a valid reading (* = last good value)` : 'Average of all good reads within 5 s';
   if (!dragging.tgt) { $('tgt').value = s.target_c; $('tgtv').textContent = s.target_c.toFixed(1); }
   if (!dragging.out) { $('out').value = s.max_output_pct; $('outv').textContent = s.max_output_pct; }
   if (!dragging.max && s.max_temperature_c != null) { $('max').value = s.max_temperature_c; $('maxv').textContent = s.max_temperature_c.toFixed(1); }
   const [label, cls] = MODE[s.mode] || [s.mode, 'warn'];
   let modeText = label;
-  if ((s.mode === 'fault' || s.mode === 'standby') && s.desired_enabled) modeText += ` (recovering ${s.recovery_samples}/3)`;
+  if (s.sensor === 'resetting' && s.mode === 'standby') modeText = `Resetting probe ${s.sensor_reset_attempt}/3`;
+  else if ((s.mode === 'fault' || s.mode === 'standby') && s.desired_enabled) modeText += ` (recovering ${s.recovery_samples}/3)`;
   $('mode').textContent = modeText; $('mode').className = 'badge ' + cls;
   const pid = s.pid_output_pct == null ? '—' : s.pid_output_pct.toFixed(1) + '%';
   $('duty').textContent = `${s.commanded_duty_pct.toFixed(0)}% ≈ ${s.commanded_duty_pct.toFixed(0)} W (PID ${pid}, cap ${s.max_output_pct}%)`;

@@ -286,18 +286,34 @@ impl HeaterControl {
         true
     }
 
-    fn trip(&mut self, fault: Fault) {
+    /// Heater off at once; PID and recovery progress start from scratch.
+    fn cut_heater(&mut self) {
         self.recovery_samples = 0;
         self.enabled = false;
-        self.fault = Some(fault);
         self.output_pct = None;
         self.pid.reset();
         self.pwm.command(0, 0.0, false);
     }
 
+    fn trip(&mut self, fault: Fault) {
+        self.cut_heater();
+        self.fault = Some(fault);
+    }
+
     pub fn sensor_error(&mut self) {
         self.last_sample = None;
         self.trip(Fault::SensorError);
+    }
+
+    /// The sensor stopped answering and a hardware reset (power cycle) is being tried. Cuts the
+    /// heater exactly like `sensor_error` (no reading is trusted, PID restarts from scratch) but
+    /// raises NO fault: the reset usually brings the probe back within seconds, and `sample`
+    /// then resumes heating after the usual 3 good windows. The user's on/off choice and any
+    /// fault already active are left alone. If the reset fails the caller escalates to
+    /// `sensor_error`.
+    pub fn sensor_resetting(&mut self) {
+        self.last_sample = None;
+        self.cut_heater();
     }
 
     /// After a power cut: heater off, no measurement carried over, resume the
@@ -531,6 +547,51 @@ mod tests {
         assert_eq!(control.fault(), None);
         assert_eq!(control.mode(), "pid");
         assert!(control.tick(3000));
+    }
+
+    #[test]
+    fn sensor_reset_cuts_heat_without_a_fault_and_resumes_after_three_good_samples() {
+        let mut control = configured();
+        control.sample(20_000, 0);
+        control.start(0).unwrap();
+        control.sample(20_000, 1000);
+        assert!(control.tick(1000));
+        control.sensor_resetting();
+        assert!(!control.tick(1001), "heater cut at once");
+        assert_eq!(control.fault(), None, "a reset in progress is not a fault");
+        assert_eq!(control.mode(), "standby");
+        assert!(control.desired_enabled(), "the user's on choice is kept");
+        assert_eq!(control.commanded_duty_pct(1001), 0.0);
+        assert_eq!(control.check_start(1001), Err(StartError::SensorNotReady));
+        control.sample(20_000, 2000);
+        control.sample(20_000, 3000);
+        assert!(!control.tick(3000));
+        assert_eq!(control.recovery_samples(), 2);
+        assert_eq!(control.fault(), None);
+        control.sample(20_000, 4000);
+        assert_eq!(control.mode(), "pid");
+        assert!(control.tick(4000));
+    }
+
+    #[test]
+    fn sensor_reset_keeps_manual_stop_and_existing_fault() {
+        let mut control = configured();
+        control.sample(20_000, 0);
+        control.start(0).unwrap();
+        control.stop();
+        control.sensor_resetting();
+        for ms in [1000, 2000, 3000, 4000] { control.sample(20_000, ms); }
+        assert_eq!(control.mode(), "stopped", "recovery never re-arms a stopped heater");
+        assert_eq!(control.fault(), None);
+        // A fault that is already active is not replaced by the reset.
+        let mut control = configured();
+        control.sample(20_000, 0);
+        control.start(0).unwrap();
+        control.sample(41_000, 1000);
+        assert_eq!(control.fault(), Some(Fault::OverTemperature));
+        control.sensor_resetting();
+        assert_eq!(control.fault(), Some(Fault::OverTemperature));
+        assert_eq!(control.mode(), "fault");
     }
 
     #[test]

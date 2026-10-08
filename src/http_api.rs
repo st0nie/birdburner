@@ -13,6 +13,7 @@ use crate::{
     heater_control::{Fault, HeaterControl, PidConfig, SafetyLimits, LIMIT_RANGE_MC, MAX_OUTPUT_RANGE_PCT, PWM_WINDOW_MS, SAMPLE_WINDOW_MS, STEP_MC, TARGET_RANGE_MC},
     persist::Settings,
     sensor_display::{DisplayTemperature, SensorDisplay},
+    sensor_recovery::{Event, PowerCycle, SensorRecovery},
 };
 
 pub type Shared = Rc<RefCell<AppState>>;
@@ -22,6 +23,8 @@ const INDEX_HTML: &str = include_str!("index.html");
 pub struct AppState {
     pub control: HeaterControl,
     pub sensor: SensorDisplay,
+    /// Probe power-cycle ladder (see `sensor_recovery`); decides when a silent probe is a fault.
+    pub recovery: SensorRecovery,
     pub temperature_mc: Option<i32>,
     pub wifi_connected: bool,
     pub ip: Option<String>,
@@ -60,7 +63,7 @@ impl AppState {
         control.set_max_output(saved.max_output_pct);
         control.restore_desired(saved.desired_enabled);
         Self {
-            control, sensor: SensorDisplay::default(), temperature_mc: None,
+            control, sensor: SensorDisplay::default(), recovery: SensorRecovery::new(), temperature_mc: None,
             wifi_connected: false, ip: None, relay_closed: false, now_ms: 0,
             sample_seq: 0, sample_hz: 0.0, settings_dirty: false, storage_ok: true,
             sensor_errors_total: 0, relay_on_ms_total: 0,
@@ -88,11 +91,13 @@ impl AppState {
     }
 
     /// One successful raw DS18B20 read. Only feeds the current window.
-    pub fn raw_reading(&mut self, mc: i32, ms: u64) {
+    /// Returns true if it ended a probe reset or sensor fault (the probe answers again).
+    pub fn raw_reading(&mut self, mc: i32, ms: u64) -> bool {
         self.roll_window(ms);
         self.window_sum_mc += mc as i64;
         self.window_ok += 1;
         self.sample_seq += 1;
+        self.recovery.good_read().is_some()
     }
 
     /// One failed raw read. Ignored for control unless the whole window fails.
@@ -133,18 +138,37 @@ impl AppState {
         self.mutate(|c| c.sample(mc, ms));
     }
 
-    /// A whole window without a single good read.
+    /// A whole window without a single good read. The probe is power-cycled first (see
+    /// `sensor_recovery`): the heater is held off meanwhile, but no fault is raised until
+    /// every reset attempt has failed.
     pub fn window_failed(&mut self, ms: u64) {
         self.now_ms = ms;
         self.temperature_mc = None;
         self.sensor.error();
-        self.mutate(|c| c.sensor_error());
+        let event = self.recovery.window_failed(ms);
+        self.apply_recovery(event);
     }
+
+    fn apply_recovery(&mut self, event: Option<Event>) {
+        match event {
+            Some(Event::AttemptStarted(_)) => self.mutate(|c| c.sensor_resetting()),
+            Some(Event::GaveUp) => self.mutate(|c| c.sensor_error()),
+            // Heating resumes through the control's own 3-good-windows rule.
+            Some(Event::Recovered) | None => {}
+        }
+    }
+
+    /// Sensor task: the next probe power cycle, if one is due.
+    pub fn take_power_cycle(&mut self) -> Option<PowerCycle> { self.recovery.take_power_cycle() }
+
+    pub fn power_cycle_pending(&self) -> bool { self.recovery.power_cycle_pending() }
 
     /// Called by the relay task; returns the SSR command.
     pub fn tick(&mut self, ms: u64) -> bool {
         self.roll_window(ms);
         self.now_ms = ms;
+        let event = self.recovery.poll(ms);
+        self.apply_recovery(event);
         if let Some(last) = self.last_tick_ms {
             if self.relay_closed { self.relay_on_ms_total += ms.saturating_sub(last); }
         }
@@ -174,6 +198,7 @@ impl AppState {
         metric("window_ok_reads", "gauge", "Good raw reads in the last 5 s window.", Some(self.last_window.0 as f64));
         metric("window_failed_reads", "gauge", "Failed raw reads in the last 5 s window.", Some(self.last_window.1 as f64));
         metric("sensor_consecutive_errors", "gauge", "Consecutive 5 s windows without a good read.", Some(self.sensor.consecutive_errors() as f64));
+        metric("sensor_resetting", "gauge", "1 while the probe is being power-cycled after it stopped answering (not a fault yet).", flag(self.recovery.resetting()));
         metric("sample_rate_hertz", "gauge", "Successful readings per second (5 s window).", Some(self.sample_hz));
         metric("pid_output_percent", "gauge", "PID computed output; absent when not computed.", c.pid_output_pct());
         metric("heater_duty_percent", "gauge", "Duty actually commanded to the SSR.", Some(c.commanded_duty_pct(self.now_ms)));
@@ -186,6 +211,8 @@ impl AppState {
         metric("uptime_seconds", "counter", "Seconds since boot; a drop means a reboot/power cut.", Some(self.now_ms as f64 / 1000.0));
         metric("sensor_readings_total", "counter", "Successful DS18B20 readings since boot.", Some(self.sample_seq as f64));
         metric("sensor_errors_total", "counter", "Failed DS18B20 readings since boot.", Some(self.sensor_errors_total as f64));
+        metric("sensor_power_cycles_total", "counter", "Probe power cycles performed since boot (VDD switched off and on).", Some(self.recovery.power_cycles_total() as f64));
+        metric("sensor_recoveries_total", "counter", "Times the probe answered again after a reset or a fault.", Some(self.recovery.recoveries_total() as f64));
         metric("heater_on_seconds_total", "counter", "Time the SSR was commanded closed since boot.", Some(self.relay_on_ms_total as f64 / 1000.0));
         metric("heater_switches_total", "counter", "SSR command transitions since boot.", Some(self.relay_switches_total as f64));
         metric("storage_writes_total", "counter", "Settings flash writes attempted since boot.", Some(self.storage_writes_total as f64));
@@ -211,7 +238,9 @@ impl AppState {
     }
 
     pub fn temp_text(&self) -> String {
-        if self.sensor.show_error() { return String::from("Sensor Error"); }
+        // While the probe is being reset the last good value stays up with `*`; "Sensor Error"
+        // is for a probe that is still silent after every reset.
+        if self.sensor.show_error() && !self.recovery.resetting() { return String::from("Sensor Error"); }
         match self.sensor.last_good_mc() {
             Some(mc) => format!("{} C{}", DisplayTemperature(mc), if self.sensor.stale() { "*" } else { "" }),
             None => format!("Reading...{}", if self.sensor.stale() { "*" } else { "" }),
@@ -224,7 +253,9 @@ impl AppState {
             temperature_c: self.temperature_mc.map(|mc| mc as f64 / 1000.0),
             display: self.temp_text(),
             target_c: c.target_mc() as f64 / 1000.0,
-            sensor: if self.sensor.stale() { "error" } else if self.temperature_mc.is_some() { "ok" } else { "reading" },
+            sensor: if self.recovery.resetting() { "resetting" } else if self.sensor.stale() { "error" } else if self.temperature_mc.is_some() { "ok" } else { "reading" },
+            sensor_reset_attempt: self.recovery.attempt(),
+            sensor_power_cycles: self.recovery.power_cycles_total(),
             last_good_temperature_c: self.sensor.last_good_mc().map(|mc| mc as f64 / 1000.0),
             consecutive_sensor_errors: self.sensor.consecutive_errors(),
             wifi_connected: self.wifi_connected, ip: self.ip.clone(),
@@ -247,6 +278,7 @@ impl AppState {
 #[derive(Serialize)]
 pub struct Status {
     pub temperature_c: Option<f64>, pub display: String, pub target_c: f64, pub sensor: &'static str,
+    pub sensor_reset_attempt: u8, pub sensor_power_cycles: u32,
     pub last_good_temperature_c: Option<f64>, pub consecutive_sensor_errors: u32,
     pub wifi_connected: bool, pub ip: Option<String>, pub ssr_command: &'static str,
     pub mode: &'static str, pub pid_enabled: bool, pub desired_enabled: bool, pub recovery_samples: u8,

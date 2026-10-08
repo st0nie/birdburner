@@ -8,6 +8,7 @@ mod heater_control;
 mod http_api;
 mod persist;
 mod sensor_display;
+mod sensor_recovery;
 
 use alloc::{format, rc::Rc};
 use core::cell::RefCell;
@@ -30,6 +31,7 @@ use esp_storage::FlashStorage;
 use heater_control::SafetyLimits;
 use http_api::{AppState, Shared};
 use persist::{Settings, RECORD_LEN, SLOT_ADDR};
+use sensor_recovery::{MAX_ATTEMPTS, Phase, PowerCycle};
 use ssd1306::{Ssd1306, prelude::*};
 use static_cell::StaticCell;
 
@@ -165,17 +167,46 @@ async fn http_task(id: usize, stack: Stack<'static>, shared: Shared) {
 
 // ---------- sensor / relay / display ----------
 
+/// After VDD returns the DS18B20 needs a moment before it answers a reset pulse.
+const PROBE_POWER_ON_SETTLE_MS: u64 = 100;
+
+/// Power-cycle the probe: DATA low + VDD off for `cycle.off_ms`, then VDD back, DATA released and
+/// a settle time. Fully async so the heater, WiFi and HTTP keep running meanwhile.
+async fn power_cycle_probe(sensor: &mut ds18b20::Ds18b20<'static>, cycle: PowerCycle) {
+    if cycle.attempt > 0 {
+        println!("[DS18B20] no valid reading: power-cycling the probe (reset {}/{}, VDD off {} ms)", cycle.attempt, MAX_ATTEMPTS, cycle.off_ms);
+    } else {
+        println!("[DS18B20] probe still silent: periodic power cycle (VDD off {} ms)", cycle.off_ms);
+    }
+    sensor.power_off();
+    Timer::after_millis(cycle.off_ms).await;
+    sensor.power_on();
+    Timer::after_millis(20).await;
+    sensor.release_data();
+    Timer::after_millis(PROBE_POWER_ON_SETTLE_MS).await;
+}
+
 #[embassy_executor::task]
 async fn sensor_task(mut sensor: ds18b20::Ds18b20<'static>, shared: Shared) {
+    // VDD was only just switched on in main(): let the probe start up.
+    Timer::after_millis(PROBE_POWER_ON_SETTLE_MS).await;
     let mut stats_at = now_ms();
     let (mut count, mut errors) = (0u32, 0u32);
     loop {
+        let due = shared.borrow_mut().take_power_cycle();
+        if let Some(cycle) = due { power_cycle_probe(&mut sensor, cycle).await; }
         match sensor.start_conversion() {
             Ok(_) => loop {
                 Timer::after_millis(10).await;
+                // A power cycle was requested: abandon this conversion, the loop top handles it.
+                if shared.borrow().power_cycle_pending() { break; }
                 if let Some(result) = sensor.poll_temperature() {
                     match result {
-                        Ok(mc) => { shared.borrow_mut().raw_reading(mc, now_ms()); count += 1; }
+                        Ok(mc) => {
+                            let back = shared.borrow_mut().raw_reading(mc, now_ms());
+                            count += 1;
+                            if back { println!("[DS18B20] probe answers again"); }
+                        }
                         Err(e) => { shared.borrow_mut().raw_error(now_ms(), e.kind()); errors += 1; println!("[DS18B20] {}", e); }
                     }
                     break;
@@ -205,12 +236,24 @@ async fn sensor_task(mut sensor: ds18b20::Ds18b20<'static>, shared: Shared) {
 #[embassy_executor::task]
 async fn relay_task(mut pin: Output<'static>, shared: Shared) {
     let mut previous = false;
+    let mut phase = Phase::Healthy;
     loop {
-        let close = shared.borrow_mut().tick(now_ms());
+        let (close, now_phase) = {
+            let mut app = shared.borrow_mut();
+            (app.tick(now_ms()), app.recovery.phase())
+        };
         pin.set_level(if close { Level::High } else { Level::Low });
         if close != previous {
             println!("[SSR] {}", if close { "ON" } else { "OFF" });
             previous = close;
+        }
+        if now_phase != phase {
+            match now_phase {
+                Phase::Healthy => println!("[SENSOR] answering again; heating resumes after 3 good windows"),
+                Phase::Resetting(n) => println!("[SENSOR] no valid reading for a whole window: heater held off, reset {}/{} (not a fault yet)", n, MAX_ATTEMPTS),
+                Phase::Failed => println!("[SENSOR] still silent after {} resets: FAULT sensor_error, retrying once a minute", MAX_ATTEMPTS),
+            }
+            phase = now_phase;
         }
         Timer::after_millis(5).await;
     }
@@ -227,6 +270,7 @@ async fn oled_task(mut display: Oled, shared: Shared) {
             let c = &app.control;
             let state = match c.fault() {
                 Some(f) => format!("FAULT {}", f.label()),
+                None if app.recovery.resetting() => format!("Sensor reset {}/{}", app.recovery.attempt(), MAX_ATTEMPTS),
                 None if c.enabled() => format!("PID {:.0}% SSR:{}", c.commanded_duty_pct(app.now_ms),
                     if app.relay_closed { "on" } else { "off" }),
                 None if c.desired_enabled() => format!("resuming {}/3", c.recovery_samples()),
@@ -268,7 +312,9 @@ async fn main(spawner: Spawner) -> ! {
     let (saved, seq, next_slot) = load_settings(&mut flash);
     let shared = Rc::new(RefCell::new(AppState::new(HEATER_SAFETY, saved)));
 
-    let sensor = ds18b20::Ds18b20::new(Flex::new(p.GPIO23));
+    // Probe VDD comes from GPIO22 (not the 3.3 V rail) so a latched-up DS18B20 can be power-cycled.
+    let probe_vdd = Output::new(p.GPIO22, Level::High, OutputConfig::default());
+    let sensor = ds18b20::Ds18b20::new(Flex::new(p.GPIO23), probe_vdd);
     let i2c = I2c::new(p.I2C0, I2cConfig::default().with_frequency(Rate::from_khz(400))).unwrap()
         .with_sda(p.GPIO6).with_scl(p.GPIO7);
     let mut display = Ssd1306::new(ssd1306::I2CDisplayInterface::new(i2c), DisplaySize128x64, DisplayRotation::Rotate0)
