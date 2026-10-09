@@ -64,6 +64,27 @@ async fn pid_endpoint_applies_reports_and_restores_gains() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn pid_endpoint_sets_d_filter_optionally() {
+    let app = app();
+    let (code, body) = request(app.clone(), "POST", "/api/pid", r#"{"kp":20,"ki":0.02,"kd":120,"d_filter_s":45.5}"#, "application/json").await;
+    assert_eq!(code, 200, "{body}");
+    let status: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status["pid_d_filter_s"].as_f64(), Some(45.5));
+    assert_eq!(app.borrow().settings().d_filter_milli, 45_500);
+    // Omitted keeps the current value.
+    let (code, _) = request(app.clone(), "POST", "/api/pid", r#"{"kp":20,"ki":0.02,"kd":100}"#, "application/json").await;
+    assert_eq!(code, 200);
+    assert_eq!(app.borrow().settings().d_filter_milli, 45_500);
+    // Out of range rejects the whole request, gains included.
+    let (code, body) = request(app.clone(), "POST", "/api/pid", r#"{"kp":30,"ki":0.02,"kd":100,"d_filter_s":300.001}"#, "application/json").await;
+    assert_eq!(code, 422);
+    assert!(body.contains("d_filter_must_be_0_to_300_s"));
+    assert_eq!(app.borrow().control.pid_gains_milli().0, 20_000);
+    let (_, body) = request(app.clone(), "GET", "/metrics", "", "application/json").await;
+    assert!(body.contains("birdburner_pid_d_filter_seconds 45.5\n"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn pid_endpoint_rejects_bad_input_atomically() {
     for (body, content_type, expected) in [
         (r#"{"kp":100.001,"ki":0.1,"kd":0}"#.to_string(), "application/json", 422),

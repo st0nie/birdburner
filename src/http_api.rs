@@ -10,7 +10,7 @@ use picoserve::{
     routing::{get, post, PathRouter},
 };
 use crate::{
-    heater_control::{Fault, HeaterControl, PidConfig, SafetyLimits, LIMIT_RANGE_MC, MAX_OUTPUT_RANGE_PCT, KD_RANGE_MILLI, KI_RANGE_MILLI, KP_RANGE_MILLI, PWM_WINDOW_MS, SAMPLE_WINDOW_MS, STEP_MC, TARGET_RANGE_MC},
+    heater_control::{Fault, HeaterControl, PidConfig, SafetyLimits, LIMIT_RANGE_MC, MAX_OUTPUT_RANGE_PCT, D_FILTER_RANGE_MILLI, KD_RANGE_MILLI, KI_RANGE_MILLI, KP_RANGE_MILLI, PWM_WINDOW_MS, SAMPLE_WINDOW_MS, STEP_MC, TARGET_RANGE_MC},
     persist::Settings,
     sensor_display::{DisplayTemperature, SensorDisplay},
     sensor_recovery::{Event, PowerCycle, SensorRecovery},
@@ -66,6 +66,7 @@ impl AppState {
         control.set_max_temperature(saved.max_temperature_mc);
         control.set_max_output(saved.max_output_pct);
         control.set_pid_gains(saved.kp_milli, saved.ki_milli, saved.kd_milli);
+        control.set_d_filter(saved.d_filter_milli);
         control.restore_desired(saved.desired_enabled);
         Self {
             control, sensor: SensorDisplay::default(), recovery: SensorRecovery::new(), temperature_mc: None,
@@ -87,12 +88,18 @@ impl AppState {
             max_temperature_mc: self.control.max_temperature_mc().unwrap_or(crate::persist::DEFAULT_MAX_MC),
             max_output_pct: self.control.max_output_pct(),
             kp_milli, ki_milli, kd_milli,
+            d_filter_milli: self.control.d_filter_milli(),
         }
     }
 
     /// Change the PID gains (thousandths); marks the settings dirty if they changed.
     pub fn mutate_gains(&mut self, kp: u32, ki: u32, kd: u32) -> bool {
         self.mutate(|c| c.set_pid_gains(kp, ki, kd))
+    }
+
+    /// Change the derivative filter time constant (thousandths of s); marks dirty if changed.
+    pub fn mutate_d_filter(&mut self, tf: u32) -> bool {
+        self.mutate(|c| c.set_d_filter(tf))
     }
 
     /// Called after storage debounce. Pending stays true until verification completes.
@@ -250,6 +257,7 @@ impl AppState {
         metric("pid_kp", "gauge", "PID proportional gain (percent per C).", Some(kp as f64 / 1000.0));
         metric("pid_ki", "gauge", "PID integral gain (percent per C per second).", Some(ki as f64 / 1000.0));
         metric("pid_kd", "gauge", "PID derivative gain (percent seconds per C).", Some(kd as f64 / 1000.0));
+        metric("pid_d_filter_seconds", "gauge", "First-order low-pass time constant on the derivative term (0 = off).", Some(c.d_filter_milli() as f64 / 1000.0));
         metric("heater_on", "gauge", "1 while the SSR is commanded closed.", flag(self.relay_closed));
         metric("heater_output_held", "gauge", "1 while last output is held during bounded probe recovery.", flag(c.holding_through_reset()));
         metric("control_enabled", "gauge", "1 while control is enabled (including bounded output hold).", flag(c.enabled()));
@@ -319,6 +327,7 @@ impl AppState {
             pid_kp: c.pid_gains_milli().0 as f64 / 1000.0,
             pid_ki: c.pid_gains_milli().1 as f64 / 1000.0,
             pid_kd: c.pid_gains_milli().2 as f64 / 1000.0,
+            pid_d_filter_s: c.d_filter_milli() as f64 / 1000.0,
             start_blocked_by: c.check_start(self.now_ms).err().map(|e| e.label()),
             storage_ok: self.storage_ok, settings_pending: self.settings_dirty || self.settings_saving,
             heater_output_held: c.holding_through_reset(), sample_seq: self.sample_seq, sample_hz: self.sample_hz,
@@ -338,7 +347,7 @@ pub struct Status {
     pub pid_output_pct: Option<f64>, pub commanded_duty_pct: f64, pub pwm_window_ms: u64,
     pub fault: Option<&'static str>,
     pub safety_configured: bool, pub max_temperature_c: Option<f64>, pub max_output_pct: u8,
-    pub pid_kp: f64, pub pid_ki: f64, pub pid_kd: f64,
+    pub pid_kp: f64, pub pid_ki: f64, pub pid_kd: f64, pub pid_d_filter_s: f64,
     pub start_blocked_by: Option<&'static str>, pub storage_ok: bool, pub settings_pending: bool,
     pub heater_output_held: bool,
     pub sample_seq: u64, pub sample_hz: f64,
@@ -370,7 +379,12 @@ struct MaxOutputRequest { max_output_pct: u8 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PidRequest { kp: f64, ki: f64, kd: f64 }
+struct PidRequest {
+    kp: f64, ki: f64, kd: f64,
+    /// Derivative filter time constant in seconds; optional, omitted keeps the current value.
+    #[serde(default)]
+    d_filter_s: Option<f64>,
+}
 
 /// Gain to thousandths: finite, rounded to 0.001, inside the allowed range.
 pub fn gain_milli(value: f64, range: core::ops::RangeInclusive<u32>) -> Option<u32> {
@@ -467,8 +481,16 @@ async fn pid(State(shared): State<Shared>, JsonBody(input): JsonBody<PidRequest>
     ) else {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "pid_gains_out_of_range_kp_0_100_ki_0_2_kd_0_200");
     };
+    let tf = match input.d_filter_s {
+        None => None,
+        Some(v) => match gain_milli(v, D_FILTER_RANGE_MILLI) {
+            Some(tf) => Some(tf),
+            None => return error(StatusCode::UNPROCESSABLE_ENTITY, "d_filter_must_be_0_to_300_s"),
+        },
+    };
     let mut app = shared.borrow_mut();
     app.mutate_gains(kp, ki, kd);
+    if let Some(tf) = tf { app.mutate_d_filter(tf); }
     json(StatusCode::OK, &app.status())
 }
 

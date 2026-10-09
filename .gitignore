@@ -7,3 +7,13 @@
 !/.pi/realmem/
 !/.pi/realmem/**
 /src/secrets.rs
+
+# Local host build output and Python caches
+/tests/host/target/
+__pycache__/
+
+# Firmware artifacts embed configured Wi-Fi credentials; never publish them
+*.elf
+*.bin
+/birdburner-macbook-firmware*.tar.gz
+/macbook-firmware/

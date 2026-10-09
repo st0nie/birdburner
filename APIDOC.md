@@ -9,7 +9,7 @@ Base URL: `http://<IP shown on the OLED>`, port 80. HTTP is handled by picoserve
 | GET | `/api/status` | Status JSON |
 | GET | `/metrics` | Prometheus metrics (text format 0.0.4) |
 | POST | `/api/target` | Set target `{"target_c":25.5}` — 15–30 °C, 0.5 °C steps, saved to flash |
-| POST | `/api/pid` | Set PID gains `{"kp":10,"ki":0.1,"kd":0}` — all three required; Kp 0–100, Ki 0–2, Kd 0–200 (rounded to 0.001), applied at the next sample, saved to flash |
+| POST | `/api/pid` | Set PID gains `{"kp":20,"ki":0.02,"kd":120,"d_filter_s":30}` — kp/ki/kd required, `d_filter_s` optional (0–300 s, 0 = off; omitted keeps current); Kp 0–100, Ki 0–2, Kd 0–200 (rounded to 0.001), applied at the next sample, saved to flash |
 | POST | `/api/max_output` | Set max heater power `{"max_output_pct":80}` — integer 10–100 %, saved to flash |
 | POST | `/api/limit` | Set safety cutoff `{"max_temperature_c":35}` — 25–40 °C, 0.5 °C steps, must exceed target by ≥2 °C, saved to flash |
 | POST | `/api/start` | Enable heating control (saved as "desired on") |
@@ -32,7 +32,8 @@ All POSTs are idempotent. On success they return the current status JSON; on fai
 | `recovery_samples` | Good samples gathered toward startup or recovery from an actual fault (resumes at 3). Successful short probe recovery while running does not require this wait |
 | `pid_output_pct` | PID-computed value, 0–`max_output_pct`; null when not computed |
 | `max_output_pct` | Max heater duty cap (%), default 100 |
-| `pid_kp` / `pid_ki` / `pid_kd` | Current PID gains (Kp %/°C, Ki %/(°C·s), Kd %·s/°C); persisted; factory 10 / 0.1 / 0 |
+| `pid_kp` / `pid_ki` / `pid_kd` | Current PID gains (Kp %/°C, Ki %/(°C·s), Kd %·s/°C); persisted; factory 20 / 0.02 / 120 |
+| `pid_d_filter_s` | Derivative first-order low-pass time constant, s (0 = off); persisted; factory 30 |
 | `commanded_duty_pct` | Duty actually commanded (2 s window, 20 ms quantised) |
 | `ssr_command` | `Closed` (energised) / `Open` — a software command, not measured load feedback |
 | `fault` | Active fault code or null. All faults auto-recover |
@@ -87,9 +88,11 @@ Observability: `sensor_resetting` (gauge), `sensor_power_cycles_total` and `sens
 
 ## Power-cut recovery
 
-Persisted to flash: target, safety limit, max output, PID gains, desired on/off. **Readings and faults are never persisted.**
+Persisted to flash: target, safety limit, max output, PID gains, derivative filter time constant, desired on/off. **Readings and faults are never persisted.**
 On boot the SSR stays open; after 3 valid fresh samples, if the saved intent is "on", the PID resumes automatically.
-Writes alternate between two sectors with a CRC; a power cut mid-write falls back to the previous valid record. BDS4 records store Kp/Ki/Kd as unsigned thousandths and validate their ranges and CRC. Older BDS1/BDS2/BDS3 records still load with their existing target/on-off/limits and default PID gains (10 / 0.1 / 0). A settings change is debounced before writing, so wait for flash confirmation. Both ESP32 RST and full power removal retain a completed flash save; the live PID integral is not persisted.
+Writes alternate between two sectors with a CRC; a power cut mid-write falls back to the previous valid record. BDS5 records (40 bytes) store Kp/Ki/Kd and the D filter time constant as unsigned thousandths and validate their ranges and CRC. Older BDS1/BDS2/BDS3 records still load with their existing target/on-off/limits and default PID gains (20 / 0.02 / 120) and D filter 30 s; BDS4 records keep their gains and get the default D filter. A settings change is debounced before writing, so wait for flash confirmation. Both ESP32 RST and full power removal retain a completed flash save; the live PID integral is not persisted. Older firmware does not understand BDS5 records; do not assume a downgrade will preserve settings.
+
+Crossing the target no longer clears the integral. Near the target, output is clamped P+I+D, so holding power may remain slightly above the target; negative error can reduce the integral when conditional integration permits it. At or above target + 1 °C, PID output is forced to zero. The absolute over-temperature cutoff, sensor protections and manual Stop are unchanged.
 
 ## /metrics (Prometheus)
 
@@ -105,6 +108,7 @@ All metrics carry the `birdburner_` prefix.
 | `sample_rate_hertz` | gauge | Successful raw sampling rate |
 | `pid_output_percent` | gauge | PID computed output; absent when not computed |
 | `max_output_percent` | gauge | Max heater duty cap |
+| `pid_d_filter_seconds` | gauge | Derivative low-pass time constant (s, 0 = off) |
 | `pid_kp` / `pid_ki` / `pid_kd` | gauge | PID gains configured in the controller; update after an accepted request and restore after reboot |
 | `heater_output_held` | gauge | 1 while the heater uses its last output during bounded probe recovery |
 | `heater_duty_percent` / `heater_on` | gauge | Commanded duty / SSR energised |
@@ -178,7 +182,7 @@ The 32 °C `TooHot` threshold is an example — adjust to your situation. Remote
 IP=192.168.50.135
 curl http://$IP/api/status
 curl -X POST http://$IP/api/target     -H 'Content-Type: application/json' -d '{"target_c":25}'
-curl -X POST http://$IP/api/pid        -H 'Content-Type: application/json' -d '{"kp":10,"ki":0.1,"kd":0}'
+curl -X POST http://$IP/api/pid        -H 'Content-Type: application/json' -d '{"kp":20,"ki":0.02,"kd":120,"d_filter_s":30}'
 curl -X POST http://$IP/api/max_output -H 'Content-Type: application/json' -d '{"max_output_pct":80}'
 curl -X POST http://$IP/api/limit      -H 'Content-Type: application/json' -d '{"max_temperature_c":35}'
 curl -X POST http://$IP/api/start

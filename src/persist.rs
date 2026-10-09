@@ -1,11 +1,11 @@
 //! Power-loss-safe settings: two alternating 4 KiB flash sectors, each record
 //! sequence-numbered and CRC-checked. The newest valid record wins, so a power
 //! cut mid-write falls back to the previous record. Measurements are never stored.
-//! v2 added the safety limit, v3 the max heater output, v4 the PID gains; older records still load
-//! (with default gains).
+//! v2 added the safety limit, v3 the max heater output, v4 the PID gains, v5 the derivative filter;
+//! older records still load (with defaults for the missing fields).
 
 use crate::heater_control::{
-    DEFAULT_KD_MILLI, DEFAULT_KI_MILLI, DEFAULT_KP_MILLI, DEFAULT_MAX_OUTPUT_PCT, KD_RANGE_MILLI, KI_RANGE_MILLI,
+    DEFAULT_D_FILTER_MILLI, DEFAULT_KD_MILLI, DEFAULT_KI_MILLI, D_FILTER_RANGE_MILLI, DEFAULT_KP_MILLI, DEFAULT_MAX_OUTPUT_PCT, KD_RANGE_MILLI, KI_RANGE_MILLI,
     KP_RANGE_MILLI, LIMIT_RANGE_MC, MAX_OUTPUT_RANGE_PCT, STEP_MC, TARGET_MARGIN_MC, TARGET_RANGE_MC,
 };
 
@@ -15,7 +15,8 @@ const MAGIC_V1: u32 = 0x4244_5331; // "BDS1": target + on/off, CRC at 16
 const MAGIC_V2: u32 = 0x4244_5332; // "BDS2": + safety limit, CRC at 20
 const MAGIC_V3: u32 = 0x4244_5333; // "BDS3": + max output in byte 13, CRC at 20
 const MAGIC_V4: u32 = 0x4244_5334; // "BDS4": + Kp/Ki/Kd (thousandths, u32 at 20/24/28), CRC at 32
-pub const RECORD_LEN: usize = 36;
+const MAGIC_V5: u32 = 0x4244_5335; // "BDS5": + derivative filter Tf (thousandths of s, u32 at 32), CRC at 36
+pub const RECORD_LEN: usize = 40;
 /// Used until the user saves a limit (and when loading v1 records).
 pub const DEFAULT_MAX_MC: i32 = 35_000;
 
@@ -29,6 +30,8 @@ pub struct Settings {
     pub kp_milli: u32,
     pub ki_milli: u32,
     pub kd_milli: u32,
+    /// Derivative low-pass time constant in thousandths of a second.
+    pub d_filter_milli: u32,
 }
 
 impl Default for Settings {
@@ -36,6 +39,7 @@ impl Default for Settings {
         Self {
             target_mc: 25_000, desired_enabled: false, max_temperature_mc: DEFAULT_MAX_MC, max_output_pct: DEFAULT_MAX_OUTPUT_PCT,
             kp_milli: DEFAULT_KP_MILLI, ki_milli: DEFAULT_KI_MILLI, kd_milli: DEFAULT_KD_MILLI,
+            d_filter_milli: DEFAULT_D_FILTER_MILLI,
         }
     }
 }
@@ -51,7 +55,7 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 
 pub fn encode(seq: u32, s: Settings) -> [u8; RECORD_LEN] {
     let mut r = [0u8; RECORD_LEN];
-    r[0..4].copy_from_slice(&MAGIC_V4.to_le_bytes());
+    r[0..4].copy_from_slice(&MAGIC_V5.to_le_bytes());
     r[4..8].copy_from_slice(&seq.to_le_bytes());
     r[8..12].copy_from_slice(&s.target_mc.to_le_bytes());
     r[12] = s.desired_enabled as u8;
@@ -61,19 +65,23 @@ pub fn encode(seq: u32, s: Settings) -> [u8; RECORD_LEN] {
     r[20..24].copy_from_slice(&s.kp_milli.to_le_bytes());
     r[24..28].copy_from_slice(&s.ki_milli.to_le_bytes());
     r[28..32].copy_from_slice(&s.kd_milli.to_le_bytes());
-    let crc = crc32(&r[..32]);
-    r[32..36].copy_from_slice(&crc.to_le_bytes());
+    r[32..36].copy_from_slice(&s.d_filter_milli.to_le_bytes());
+    let crc = crc32(&r[..36]);
+    r[36..40].copy_from_slice(&crc.to_le_bytes());
     r
 }
 
 pub fn decode(r: &[u8; RECORD_LEN]) -> Option<(u32, Settings)> {
     let word = |i: usize| u32::from_le_bytes([r[i], r[i + 1], r[i + 2], r[i + 3]]);
     let defaults = (DEFAULT_KP_MILLI, DEFAULT_KI_MILLI, DEFAULT_KD_MILLI);
-    let (max_temperature_mc, max_output_pct, (kp_milli, ki_milli, kd_milli)) = match word(0) {
-        MAGIC_V1 if word(16) == crc32(&r[..16]) => (DEFAULT_MAX_MC, DEFAULT_MAX_OUTPUT_PCT, defaults),
-        MAGIC_V2 if word(20) == crc32(&r[..20]) => (word(16) as i32, DEFAULT_MAX_OUTPUT_PCT, defaults),
-        MAGIC_V3 if word(20) == crc32(&r[..20]) => (word(16) as i32, r[13], defaults),
-        MAGIC_V4 if word(32) == crc32(&r[..32]) => (word(16) as i32, r[13], (word(20), word(24), word(28))),
+    let tf = DEFAULT_D_FILTER_MILLI;
+    let (max_temperature_mc, max_output_pct, (kp_milli, ki_milli, kd_milli), d_filter_milli) = match word(0) {
+        MAGIC_V1 if word(16) == crc32(&r[..16]) => (DEFAULT_MAX_MC, DEFAULT_MAX_OUTPUT_PCT, defaults, tf),
+        MAGIC_V2 if word(20) == crc32(&r[..20]) => (word(16) as i32, DEFAULT_MAX_OUTPUT_PCT, defaults, tf),
+        MAGIC_V3 if word(20) == crc32(&r[..20]) => (word(16) as i32, r[13], defaults, tf),
+        // User-saved v4 gains are kept; the filter they were tuned without gets the default.
+        MAGIC_V4 if word(32) == crc32(&r[..32]) => (word(16) as i32, r[13], (word(20), word(24), word(28)), tf),
+        MAGIC_V5 if word(36) == crc32(&r[..36]) => (word(16) as i32, r[13], (word(20), word(24), word(28)), word(32)),
         _ => return None,
     };
     let target_mc = word(8) as i32;
@@ -82,8 +90,9 @@ pub fn decode(r: &[u8; RECORD_LEN]) -> Option<(u32, Settings)> {
         || !LIMIT_RANGE_MC.contains(&max_temperature_mc) || !on_grid(max_temperature_mc)
         || max_temperature_mc < target_mc + TARGET_MARGIN_MC
         || !MAX_OUTPUT_RANGE_PCT.contains(&max_output_pct)
-        || !KP_RANGE_MILLI.contains(&kp_milli) || !KI_RANGE_MILLI.contains(&ki_milli) || !KD_RANGE_MILLI.contains(&kd_milli) { return None; }
-    Some((word(4), Settings { target_mc, desired_enabled: r[12] == 1, max_temperature_mc, max_output_pct, kp_milli, ki_milli, kd_milli }))
+        || !KP_RANGE_MILLI.contains(&kp_milli) || !KI_RANGE_MILLI.contains(&ki_milli) || !KD_RANGE_MILLI.contains(&kd_milli)
+        || !D_FILTER_RANGE_MILLI.contains(&d_filter_milli) { return None; }
+    Some((word(4), Settings { target_mc, desired_enabled: r[12] == 1, max_temperature_mc, max_output_pct, kp_milli, ki_milli, kd_milli, d_filter_milli }))
 }
 
 /// Pick the newest valid slot. Returns (settings, seq, slot index of newest).
@@ -99,7 +108,7 @@ pub fn choose(slots: [Option<(u32, Settings)>; 2]) -> Option<(Settings, u32, usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    const S: Settings = Settings { target_mc: 27_500, desired_enabled: true, max_temperature_mc: 33_000, max_output_pct: 70, kp_milli: 12_500, ki_milli: 250, kd_milli: 1_500 };
+    const S: Settings = Settings { target_mc: 27_500, desired_enabled: true, max_temperature_mc: 33_000, max_output_pct: 70, kp_milli: 12_500, ki_milli: 250, kd_milli: 1_500, d_filter_milli: 12_000 };
 
     #[test]
     fn roundtrip_and_corruption() {
@@ -125,7 +134,7 @@ mod tests {
         r[16..20].copy_from_slice(&crc.to_le_bytes());
         r[20..24].copy_from_slice(&[0xff; 4]); // rest of the erased sector
         let d = Settings::default();
-        assert_eq!(decode(&r), Some((9, Settings { max_temperature_mc: DEFAULT_MAX_MC, max_output_pct: DEFAULT_MAX_OUTPUT_PCT, kp_milli: d.kp_milli, ki_milli: d.ki_milli, kd_milli: d.kd_milli, ..S })));
+        assert_eq!(decode(&r), Some((9, Settings { max_temperature_mc: DEFAULT_MAX_MC, max_output_pct: DEFAULT_MAX_OUTPUT_PCT, kp_milli: d.kp_milli, ki_milli: d.ki_milli, kd_milli: d.kd_milli, d_filter_milli: d.d_filter_milli, ..S })));
     }
 
     #[test]
@@ -136,7 +145,7 @@ mod tests {
         let crc = crc32(&r[..20]);
         r[20..24].copy_from_slice(&crc.to_le_bytes());
         let d = Settings::default();
-        assert_eq!(decode(&r), Some((4, Settings { max_output_pct: DEFAULT_MAX_OUTPUT_PCT, kp_milli: d.kp_milli, ki_milli: d.ki_milli, kd_milli: d.kd_milli, ..S })));
+        assert_eq!(decode(&r), Some((4, Settings { max_output_pct: DEFAULT_MAX_OUTPUT_PCT, kp_milli: d.kp_milli, ki_milli: d.ki_milli, kd_milli: d.kd_milli, d_filter_milli: d.d_filter_milli, ..S })));
     }
 
     #[test]
@@ -148,8 +157,27 @@ mod tests {
         let crc = crc32(&r[..20]);
         r[20..24].copy_from_slice(&crc.to_le_bytes());
         let d = Settings::default();
-        assert_eq!(decode(&r), Some((5, Settings { kp_milli: d.kp_milli, ki_milli: d.ki_milli, kd_milli: d.kd_milli, ..S })));
-        assert_eq!((d.kp_milli, d.ki_milli, d.kd_milli), (10_000, 100, 0));
+        assert_eq!(decode(&r), Some((5, Settings { kp_milli: d.kp_milli, ki_milli: d.ki_milli, kd_milli: d.kd_milli, d_filter_milli: d.d_filter_milli, ..S })));
+        assert_eq!((d.kp_milli, d.ki_milli, d.kd_milli, d.d_filter_milli), (20_000, 20, 120_000, 30_000));
+    }
+
+    #[test]
+    fn v4_record_keeps_gains_and_gets_default_filter() {
+        let mut r = [0xffu8; RECORD_LEN];
+        r[..32].copy_from_slice(&encode(6, S)[..32]);
+        r[0..4].copy_from_slice(&0x4244_5334u32.to_le_bytes());
+        let crc = crc32(&r[..32]);
+        r[32..36].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode(&r), Some((6, Settings { d_filter_milli: DEFAULT_D_FILTER_MILLI, ..S })));
+    }
+
+    #[test]
+    fn d_filter_roundtrips_and_is_range_checked() {
+        for tf in [0, 30_000, 300_000] {
+            let s = Settings { d_filter_milli: tf, ..S };
+            assert_eq!(decode(&encode(2, s)), Some((2, s)), "{tf}");
+        }
+        assert_eq!(decode(&encode(2, Settings { d_filter_milli: 300_001, ..S })), None);
     }
 
     #[test]

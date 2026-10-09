@@ -128,17 +128,18 @@ OLED line 3 `PID 7% SSR:off` means the PID is running at 7 % duty and the SSR ha
 
 ## PID tuning
 
-Tune from the phone page: the **PID parameters** panel has Kp, Ki and Kd boxes and an **Apply PID** button. The values are applied from the next 5 s sample and **saved to flash** (they survive power cuts, like the other settings). The same over HTTP: `POST /api/pid {"kp":10,"ki":0.1,"kd":0}` (see [APIDOC.md](APIDOC.md)); the current values are in `/api/status` (`pid_kp`, `pid_ki`, `pid_kd`) and `/metrics` (`birdburner_pid_kp/ki/kd`), handy to overlay on the Grafana curves.
+Tune from the phone page: the **PID parameters** panel has Kp, Ki, Kd and Tf boxes and an **Apply PID** button. The values are applied from the next 5 s sample and **saved to flash** (they survive power cuts, like the other settings). The same over HTTP: `POST /api/pid {"kp":20,"ki":0.02,"kd":120,"d_filter_s":30}` (see [APIDOC.md](APIDOC.md)); the current values are in `/api/status` (`pid_kp`, `pid_ki`, `pid_kd`, `pid_d_filter_s`) and `/metrics` (`birdburner_pid_kp/ki/kd`, `birdburner_pid_d_filter_seconds`), handy to overlay on the Grafana curves.
 
-These are **provisional, not tuned** on this cage. Factory values: Kp 10, Ki 0.1, Kd 0 (flash records written before this feature load with them).
+Factory starting values: Kp 20, Ki 0.02, Kd 120, Tf 30 s. The observed closed-loop data at 25 °C motivated reducing integral action and filtering the derivative. Ambient temperature was not measured and there was no controlled step test, so the thermal gain and delay are not identified; illustrative simulations are not hardware validation. Verify and tune on the cage, especially with the cover on vs off. Saved v4 gains are kept on upgrade and get the default Tf; v1–v3 records get all defaults. Use **Load defaults → Apply PID** to replace saved gains explicitly.
 
 | Field | Meaning / unit | Allowed |
 | --- | --- | --- |
 | Kp | Proportional gain, output %/°C | 0–100 |
 | Ki | Integral gain, output %/(°C·s) | 0–2 |
 | Kd | Derivative gain (on measurement), output %·s/°C | 0–200 |
+| Tf | Derivative first-order low-pass time constant, s (`d_filter_s`); α = dt/(Tf+dt), 0 = off | 0–300 |
 
-Values are kept to 0.001. **Maximum output** (10–100 %) is the duty cap; the integral is clamped to it. Changing gains retains the integral unless Ki is set to zero, which clears it; gains can still change the output at the next sample. The factory defaults live in `src/heater_control.rs` (`DEFAULT_KP_MILLI`, `DEFAULT_KI_MILLI`, `DEFAULT_KD_MILLI`, in thousandths).
+Values are kept to 0.001. **Maximum output** (10–100 %) is the duty cap; the integral is clamped to it. Crossing the target does not clear the integral: slightly above target the output is P+I+D (I bleeds down through the negative error), and at target + 1 °C (`HEAT_CUTOFF_ABOVE_TARGET_C`) the output is forced to 0 while the integral is kept. The over-temperature cutoff is unchanged. Changing gains retains the integral unless Ki is set to zero, which clears it; gains can still change the output at the next sample. The factory defaults live in `src/heater_control.rs` (`DEFAULT_KP_MILLI`, `DEFAULT_KI_MILLI`, `DEFAULT_KD_MILLI`, `DEFAULT_D_FILTER_MILLI`, in thousandths).
 
 Same file, at the top:
 
@@ -147,7 +148,7 @@ Same file, at the top:
 - `SAMPLE_WINDOW_MS = 5000`: one control sample per 5 s averaging window.
 - `SENSOR_MAX_AGE_MS = 12_000`: sample older than this cuts the heater (except while a probe power reset is bridging it, see above).
 
-Tuning order: set real safety limits and verify wiring first; start with `ki=0`, `kd=0`, tune `kp`; add `ki` only to remove steady-state offset; change one parameter at a time and watch the response.
+Tuning order: set real safety limits and verify wiring first; start with `ki=0`, `kd=0`, tune `kp`; with Kd on, raise Tf if the output twitches on single 0.0625 °C steps; add `ki` only to remove steady-state offset; change one parameter at a time and watch the response.
 
 ## Build & flash
 
@@ -199,7 +200,7 @@ curl http://$IP/api/status
 curl http://$IP/metrics
 curl -X POST http://$IP/api/target     -H 'Content-Type: application/json' -d '{"target_c":25.5}'
 curl -X POST http://$IP/api/max_output -H 'Content-Type: application/json' -d '{"max_output_pct":100}'
-curl -X POST http://$IP/api/pid        -H 'Content-Type: application/json' -d '{"kp":10,"ki":0.1,"kd":0}'
+curl -X POST http://$IP/api/pid        -H 'Content-Type: application/json' -d '{"kp":20,"ki":0.02,"kd":120,"d_filter_s":30}'
 curl -X POST http://$IP/api/limit      -H 'Content-Type: application/json' -d '{"max_temperature_c":35}'
 curl -X POST http://$IP/api/start
 curl -X POST http://$IP/api/stop

@@ -72,7 +72,7 @@ fn read_slot(flash: &mut FlashStorage, i: usize) -> Option<(u32, Settings)> {
 fn load_settings(flash: &mut FlashStorage) -> (Settings, u32, usize) {
     match persist::choose([read_slot(flash, 0), read_slot(flash, 1)]) {
         Some((s, seq, slot)) => {
-            println!("[STORE] restored target={} limit={} max_out={}% desired_on={} pid={}/{}/{} (seq {})", s.target_mc, s.max_temperature_mc, s.max_output_pct, s.desired_enabled, s.kp_milli, s.ki_milli, s.kd_milli, seq);
+            println!("[STORE] restored target={} limit={} max_out={}% desired_on={} pid={}/{}/{} tf={} (seq {})", s.target_mc, s.max_temperature_mc, s.max_output_pct, s.desired_enabled, s.kp_milli, s.ki_milli, s.kd_milli, s.d_filter_milli, seq);
             (s, seq, 1 - slot)
         }
         None => {
@@ -101,7 +101,7 @@ async fn storage_task(mut flash: FlashStorage, shared: Shared, mut seq: u32, mut
         seq = seq.wrapping_add(1);
         let ok = write_slot(&mut flash, slot, seq, s);
         if ok { slot = 1 - slot; }
-        println!("[STORE] save target={} limit={} max_out={}% desired_on={} pid={}/{}/{} -> {}", s.target_mc, s.max_temperature_mc, s.max_output_pct, s.desired_enabled, s.kp_milli, s.ki_milli, s.kd_milli, if ok { "ok" } else { "FAILED" });
+        println!("[STORE] save target={} limit={} max_out={}% desired_on={} pid={}/{}/{} tf={} -> {}", s.target_mc, s.max_temperature_mc, s.max_output_pct, s.desired_enabled, s.kp_milli, s.ki_milli, s.kd_milli, s.d_filter_milli, if ok { "ok" } else { "FAILED" });
         shared.borrow_mut().finish_settings_save(ok);
     }
 }

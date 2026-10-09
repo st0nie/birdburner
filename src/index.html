@@ -139,10 +139,11 @@
         <div class="param-row"><div><label for="kp"><span class="gain-id mono">Kp</span><span class="param-name">Proportional</span></label><div class="param-desc">% / °C · range 0–100</div></div><div class="input-wrap"><input id="kp" class="gain-input" type="number" min="0" max="100" step="0.001" required disabled></div></div>
         <div class="param-row"><div><label for="ki"><span class="gain-id mono">Ki</span><span class="param-name">Integral</span></label><div class="param-desc">% / (°C · s) · range 0–2</div></div><div class="input-wrap"><input id="ki" class="gain-input" type="number" min="0" max="2" step="0.001" required disabled></div></div>
         <div class="param-row"><div><label for="kd"><span class="gain-id mono">Kd</span><span class="param-name">Derivative</span></label><div class="param-desc">% · s / °C · range 0–200</div></div><div class="input-wrap"><input id="kd" class="gain-input" type="number" min="0" max="200" step="0.001" required disabled></div></div>
+        <div class="param-row"><div><label for="tf"><span class="gain-id mono">Tf</span><span class="param-name">D filter</span></label><div class="param-desc">Derivative low-pass, s · range 0–300 · 0 = off</div></div><div class="input-wrap"><input id="tf" class="gain-input" type="number" min="0" max="300" step="0.001" required disabled></div></div>
         <div class="apply-row"><button id="defaults" class="defaults" type="button" disabled>Load defaults</button><button id="pidsave" class="button primary" disabled>Apply PID</button></div>
       </form>
       <p id="pidmsg" class="local-feedback" role="status" aria-live="polite"></p>
-      <div class="explanation">Applied at the next valid sample; saved to flash. Defaults: 10 / 0.1 / 0. Derivative uses the measured temperature; keep Kd at 0 unless tuned.</div>
+      <div class="explanation">Applied at the next valid sample; saved to flash. Defaults: Kp 20 / Ki 0.02 / Kd 120 / Tf 30 s. Derivative uses the measured temperature, smoothed by a first-order filter with time constant Tf.</div>
     </section>
   </div>
   <details class="panel diagnostics">
@@ -162,11 +163,11 @@
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
-const fields = { tgt:'target_c', out:'max_output_pct', max:'max_temperature_c', kp:'pid_kp', ki:'pid_ki', kd:'pid_kd' };
+const fields = { tgt:'target_c', out:'max_output_pct', max:'max_temperature_c', kp:'pid_kp', ki:'pid_ki', kd:'pid_kd', tf:'pid_d_filter_s' };
 const dirty = new Set();
 const MODE = { pid:['AUTO / HEATING','ok'], standby:['STANDBY','warn'], stopped:['STOPPED',''], fault:['FAULT','bad'] };
 const FAULT = { sensor_error:'Probe unavailable after automatic recovery. Heater off; retrying every minute.', sensor_stale:'No fresh measurement within the permitted recovery time. Heater off.', invalid_sample:'Invalid temperature sample. Heater off.', over_temperature:'Temperature cutoff active. Heater off until 3 °C below the limit.', invalid_config:'Control configuration invalid. Heater off.' };
-const ERR = { safety_not_configured:'Safety configuration is required.', sensor_not_ready:'Waiting for a valid temperature.', over_temperature:'Too close to the temperature cutoff.', invalid_config:'Control configuration invalid.', target_must_be_15_to_30_in_0_5_steps:'Setpoint must be 15–30 °C in 0.5 °C steps.', target_too_close_to_safety_limit:'Setpoint must be at least 2 °C below the cutoff.', limit_must_be_25_to_40_in_0_5_steps:'Cutoff must be 25–40 °C in 0.5 °C steps.', limit_must_be_at_least_target_plus_2:'Cutoff must be at least 2 °C above the setpoint.', max_output_must_be_10_to_100:'Output limit must be 10–100%.', pid_gains_out_of_range_kp_0_100_ki_0_2_kd_0_200:'PID ranges: Kp 0–100, Ki 0–2, Kd 0–200.' };
+const ERR = { safety_not_configured:'Safety configuration is required.', sensor_not_ready:'Waiting for a valid temperature.', over_temperature:'Too close to the temperature cutoff.', invalid_config:'Control configuration invalid.', target_must_be_15_to_30_in_0_5_steps:'Setpoint must be 15–30 °C in 0.5 °C steps.', target_too_close_to_safety_limit:'Setpoint must be at least 2 °C below the cutoff.', limit_must_be_25_to_40_in_0_5_steps:'Cutoff must be 25–40 °C in 0.5 °C steps.', limit_must_be_at_least_target_plus_2:'Cutoff must be at least 2 °C above the setpoint.', max_output_must_be_10_to_100:'Output limit must be 10–100%.', pid_gains_out_of_range_kp_0_100_ki_0_2_kd_0_200:'PID ranges: Kp 0–100, Ki 0–2, Kd 0–200.', d_filter_must_be_0_to_300_s:'D filter must be 0–300 s.' };
 let last = null, connected = false, busy = false, generation = 0, statusAt = 0, commandAbort = null, activeBox = null;
 let messageToken = 0, transientMessage = false;
 const localTokens = new Map(), pendingWrites = new Map();
@@ -199,7 +200,7 @@ function flashMessage(text, error=false) {
 function buttons() {
   for (const id of Object.keys(fields)) $(id).disabled = !connected || busy;
   for (const [id,input] of [['tgtsave','tgt'],['outsave','out'],['maxsave','max']]) $(id).disabled = !connected || busy || !dirty.has(input);
-  $('pidsave').disabled = !connected || busy || !['kp','ki','kd'].some(id=>dirty.has(id));
+  $('pidsave').disabled = !connected || busy || !['kp','ki','kd','tf'].some(id=>dirty.has(id));
   $('defaults').disabled = !connected || busy;
   $('start').disabled = !connected || busy || !last || last.pid_enabled || !!last.start_blocked_by;
   // A stop must remain available even while a settings request is in flight.
@@ -318,7 +319,7 @@ async function act(path,body,ids=[],label='Command accepted') {
 }
 for (const id of Object.keys(fields)) $(id).addEventListener('input',()=>{
   dirty.add(id);buttons();
-  const box=['kp','ki','kd'].includes(id) ? 'pidmsg' : 'limitsmsg';
+  const box=['kp','ki','kd','tf'].includes(id) ? 'pidmsg' : 'limitsmsg';
   if (!pendingWrites.has(box)) localMessage(box);
 });
 for (const [form,id,path,key,label] of [
@@ -328,11 +329,11 @@ for (const [form,id,path,key,label] of [
 ]) $(form).addEventListener('submit',e=>{e.preventDefault();act(path,{[key]:Number($(id).value)},[id],label);});
 $('pidform').addEventListener('submit',e=>{
   e.preventDefault();
-  const gains={kp:Number($('kp').value),ki:Number($('ki').value),kd:Number($('kd').value)};
-  act('/api/pid',gains,['kp','ki','kd'],'PID parameters');
+  const gains={kp:Number($('kp').value),ki:Number($('ki').value),kd:Number($('kd').value),d_filter_s:Number($('tf').value)};
+  act('/api/pid',gains,['kp','ki','kd','tf'],'PID parameters');
 });
 $('defaults').onclick=()=>{
-  for (const [id,value] of [['kp',10],['ki',0.1],['kd',0]]) { $(id).value=value; dirty.add(id); }
+  for (const [id,value] of [['kp',20],['ki',0.02],['kd',120],['tf',30]]) { $(id).value=value; dirty.add(id); }
   buttons(); localMessage('pidmsg','Defaults loaded. Apply PID to send them.');
 };
 $('start').onclick=()=>act('/api/start',null,[],'Heating enabled');

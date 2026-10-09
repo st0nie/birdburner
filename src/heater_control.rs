@@ -15,10 +15,20 @@ pub const SENSOR_RECOVERY_SAMPLES: u8 = 3;
 pub const MAX_OUTPUT_RANGE_PCT: core::ops::RangeInclusive<u8> = 10..=100;
 pub const DEFAULT_MAX_OUTPUT_PCT: u8 = 100;
 /// PID gains are stored and exchanged in thousandths. Kp: percent / C, Ki: percent / (C * s),
-/// Kd: percent * s / C. Defaults are provisional (not tuned on this cage).
-pub const DEFAULT_KP_MILLI: u32 = 10_000;
-pub const DEFAULT_KI_MILLI: u32 = 100;
-pub const DEFAULT_KD_MILLI: u32 = 0;
+/// Kd: percent * s / C. Starting values informed by observed closed-loop temperature/output:
+/// Kp 20 / Ki 0.02 (Ti ~1000 s) / Kd 120 (Td 6 s), with a 30 s derivative filter.
+/// Lower integral action avoids the previous rapid output ramp. Ambient temperature and a
+/// controlled step response were not measured; these values still need on-hardware tuning.
+pub const DEFAULT_KP_MILLI: u32 = 20_000;
+pub const DEFAULT_KI_MILLI: u32 = 20;
+pub const DEFAULT_KD_MILLI: u32 = 120_000;
+/// First-order low-pass time constant on the derivative term, thousandths of a second.
+/// 0 disables filtering. 30 s spans six samples: one 0.0625 C LSB step then moves the D term by
+/// at most Kd * 0.0625 / (5 + 30) instead of Kd * 0.0625 / 5.
+pub const DEFAULT_D_FILTER_MILLI: u32 = 30_000;
+/// At or above target + this, the PID output is forced to 0 regardless of the integral.
+pub const HEAT_CUTOFF_ABOVE_TARGET_C: f64 = 1.0;
+pub const D_FILTER_RANGE_MILLI: core::ops::RangeInclusive<u32> = 0..=300_000;
 pub const KP_RANGE_MILLI: core::ops::RangeInclusive<u32> = 0..=100_000;
 pub const KI_RANGE_MILLI: core::ops::RangeInclusive<u32> = 0..=2_000;
 pub const KD_RANGE_MILLI: core::ops::RangeInclusive<u32> = 0..=200_000;
@@ -28,6 +38,7 @@ pub struct PidConfig {
     pub kp: f64, // percent / C
     pub ki: f64, // percent / (C * second)
     pub kd: f64, // percent * second / C; derivative on measurement
+    pub d_filter_s: f64, // first-order low-pass time constant on the derivative; 0 = off
     pub output_limit_pct: f64,
 }
 
@@ -35,7 +46,7 @@ impl Default for PidConfig {
     fn default() -> Self {
         // Gains are provisional (not tuned on this cage). The output limit is
         // only the first-boot default; the user can change it from the web page.
-        Self { kp: DEFAULT_KP_MILLI as f64 / 1000.0, ki: DEFAULT_KI_MILLI as f64 / 1000.0, kd: DEFAULT_KD_MILLI as f64 / 1000.0, output_limit_pct: DEFAULT_MAX_OUTPUT_PCT as f64 }
+        Self { kp: DEFAULT_KP_MILLI as f64 / 1000.0, ki: DEFAULT_KI_MILLI as f64 / 1000.0, kd: DEFAULT_KD_MILLI as f64 / 1000.0, d_filter_s: DEFAULT_D_FILTER_MILLI as f64 / 1000.0, output_limit_pct: DEFAULT_MAX_OUTPUT_PCT as f64 }
     }
 }
 
@@ -90,15 +101,17 @@ pub struct Pid {
     config: PidConfig,
     integral: f64,
     previous_sample: Option<(u64, f64)>,
+    /// Low-pass filtered derivative of the measurement (C/s, negated).
+    filtered_derivative: f64,
 }
 
 impl Pid {
     pub fn new(config: PidConfig) -> Self {
-        Self { config, integral: 0.0, previous_sample: None }
+        Self { config, integral: 0.0, previous_sample: None, filtered_derivative: 0.0 }
     }
 
     pub fn valid(&self) -> bool {
-        [self.config.kp, self.config.ki, self.config.kd].iter().all(|v| v.is_finite() && *v >= 0.0)
+        [self.config.kp, self.config.ki, self.config.kd, self.config.d_filter_s].iter().all(|v| v.is_finite() && *v >= 0.0)
             && self.config.output_limit_pct.is_finite()
             && self.config.output_limit_pct > 0.0 && self.config.output_limit_pct <= 100.0
     }
@@ -106,6 +119,7 @@ impl Pid {
     pub fn reset(&mut self) {
         self.integral = 0.0;
         self.previous_sample = None;
+        self.filtered_derivative = 0.0;
     }
 
     /// Bridge a short measurement gap: keep the integral (the learned steady-state output) but
@@ -113,6 +127,7 @@ impl Pid {
     /// kick, and `update` does not treat it as a gap that wipes the integral.
     pub fn hold(&mut self) {
         self.previous_sample = None;
+        self.filtered_derivative = 0.0;
     }
 
     pub fn output_limit_pct(&self) -> f64 { self.config.output_limit_pct }
@@ -130,6 +145,13 @@ impl Pid {
         self.config.ki = ki as f64 / 1000.0;
         self.config.kd = kd as f64 / 1000.0;
         if ki == 0 { self.integral = 0.0; }
+    }
+
+    pub fn d_filter_milli(&self) -> u32 { (self.config.d_filter_s * 1000.0 + 0.5) as u32 }
+
+    /// Takes effect at the next sample; the current filter state is kept.
+    pub fn set_d_filter_milli(&mut self, tf: u32) {
+        self.config.d_filter_s = tf as f64 / 1000.0;
     }
 
     /// Lowering the limit also clamps the integral so the cap applies at once.
@@ -154,16 +176,15 @@ impl Pid {
                 self.reset(); // do not accumulate integral across a measurement gap
             } else {
                 dt_s = elapsed as f64 / 1000.0;
-                derivative = -(actual_c - previous_temp) / dt_s;
+                let raw = -(actual_c - previous_temp) / dt_s;
+                // Discrete first-order low-pass: alpha = dt / (Tf + dt); Tf = 0 passes raw.
+                let alpha = dt_s / (self.config.d_filter_s + dt_s);
+                self.filtered_derivative += alpha * (raw - self.filtered_derivative);
+                derivative = self.filtered_derivative;
             }
         }
         self.previous_sample = Some((now_ms, actual_c));
         let error = target_c - actual_c;
-        // Heat-only safety behavior: never demand heat at/above the target.
-        if error <= 0.0 {
-            self.integral = 0.0;
-            return Some(0.0);
-        }
         let proportional = self.config.kp * error;
         let d_term = self.config.kd * derivative;
         let candidate_i = (self.integral + self.config.ki * error * dt_s)
@@ -178,6 +199,10 @@ impl Pid {
             self.reset();
             return None;
         }
+        // Heat-only guard: well above the target never heat. The integral is kept (it is the
+        // learned holding power) and bleeds down through the negative error while P+I+D still
+        // fits the output range; clearing it at the target caused the sawtooth seen on 2026-10-09.
+        if -error >= HEAT_CUTOFF_ABOVE_TARGET_C { return Some(0.0); }
         Some(output.clamp(0.0, self.config.output_limit_pct))
     }
 }
@@ -385,6 +410,15 @@ impl HeaterControl {
         true
     }
 
+    pub fn d_filter_milli(&self) -> u32 { self.pid.d_filter_milli() }
+
+    /// Change the derivative filter time constant (thousandths of a second); rejected when out of range.
+    pub fn set_d_filter(&mut self, tf: u32) -> bool {
+        if !D_FILTER_RANGE_MILLI.contains(&tf) { return false; }
+        self.pid.set_d_filter_milli(tf);
+        true
+    }
+
     /// After a power cut: heater off, no measurement carried over, resume the
     /// saved on/off choice once fresh readings arrive.
     pub fn restore_desired(&mut self, desired: bool) {
@@ -512,13 +546,16 @@ impl HeaterControl {
 mod tests {
     use super::*;
 
+    /// Fixed gains the behaviour tests were written against, independent of the factory defaults.
+    fn legacy() -> PidConfig { PidConfig { kp: 10.0, ki: 0.1, kd: 0.0, d_filter_s: 0.0, output_limit_pct: 100.0 } }
+
     fn configured() -> HeaterControl {
-        HeaterControl::new(PidConfig::default(), Some(SafetyLimits { max_temperature_mc: 40_000, heater_watts: 100 }))
+        HeaterControl::new(legacy(), Some(SafetyLimits { max_temperature_mc: 40_000, heater_watts: 100 }))
     }
 
     #[test]
     fn pid_proportional_capped_and_heat_only() {
-        let mut pid = Pid::new(PidConfig { kp: 10.0, ki: 0.0, kd: 0.0, output_limit_pct: 30.0 });
+        let mut pid = Pid::new(PidConfig { kp: 10.0, ki: 0.0, kd: 0.0, d_filter_s: 0.0, output_limit_pct: 30.0 });
         assert_eq!(pid.update(25.0, 24.0, 0), Some(10.0));
         assert_eq!(pid.update(25.0, 10.0, 1000), Some(30.0));
         assert_eq!(pid.update(25.0, 25.0, 2000), Some(0.0));
@@ -526,11 +563,27 @@ mod tests {
     }
 
     #[test]
+    fn integral_survives_crossing_the_target_and_bleeds_down() {
+        let mut pid = Pid::new(PidConfig { kp: 1.0, ki: 0.1, kd: 0.0, d_filter_s: 0.0, output_limit_pct: 100.0 });
+        pid.integral = 10.0; // learned holding power
+        pid.update(25.0, 25.0, 0);
+        // Slightly above target: still heats with I minus P, and I decreases.
+        let out = pid.update(25.0, 25.2, 5000).unwrap();
+        assert!((out - (10.0 - 0.1 - 0.2)).abs() < 1e-9, "{out}");
+        assert!((pid.integral - 9.9).abs() < 1e-9);
+        // At target + 1 C the output is forced off but the integral is not cleared.
+        assert_eq!(pid.update(25.0, 26.0, 10_000), Some(0.0));
+        assert!(pid.integral > 9.0 && pid.integral < 9.9);
+        // Back below target: resumes from the kept integral, no restart from zero.
+        assert!(pid.update(25.0, 24.9, 15_000).unwrap() > 9.0);
+    }
+
+    #[test]
     fn integral_uses_actual_dt_and_anti_windup() {
-        let mut pid = Pid::new(PidConfig { kp: 0.0, ki: 1.0, kd: 0.0, output_limit_pct: 30.0 });
+        let mut pid = Pid::new(PidConfig { kp: 0.0, ki: 1.0, kd: 0.0, d_filter_s: 0.0, output_limit_pct: 30.0 });
         assert_eq!(pid.update(25.0, 24.0, 0), Some(0.0));
         assert_eq!(pid.update(25.0, 24.0, 2000), Some(2.0));
-        let mut pid = Pid::new(PidConfig { output_limit_pct: 30.0, ..PidConfig::default() });
+        let mut pid = Pid::new(PidConfig { output_limit_pct: 30.0, ..legacy() });
         for ms in (0..100_000).step_by(1000) { assert_eq!(pid.update(25.0, 10.0, ms), Some(30.0)); }
         assert_eq!(pid.integral, 0.0);
         assert!(pid.update(25.0, 24.9, 100_000).unwrap() < 2.0);
@@ -538,21 +591,53 @@ mod tests {
 
     #[test]
     fn derivative_is_on_measurement_not_setpoint() {
-        let mut pid = Pid::new(PidConfig { kp: 1.0, ki: 0.0, kd: 2.0, output_limit_pct: 100.0 });
+        let mut pid = Pid::new(PidConfig { kp: 1.0, ki: 0.0, kd: 2.0, d_filter_s: 0.0, output_limit_pct: 100.0 });
         assert_eq!(pid.update(25.0, 20.0, 0), Some(5.0));
         assert_eq!(pid.update(30.0, 20.0, 1000), Some(10.0));
         assert_eq!(pid.update(30.0, 21.0, 2000), Some(7.0));
     }
 
     #[test]
+    fn derivative_low_pass_filters_lsb_steps() {
+        // Kd 100, Tf 15 s, 5 s samples: alpha = 5 / 20 = 0.25.
+        let cfg = PidConfig { kp: 0.0, ki: 0.0, kd: 100.0, d_filter_s: 15.0, output_limit_pct: 100.0 };
+        let mut pid = Pid::new(cfg);
+        assert_eq!(pid.update(30.0, 20.0, 0), Some(0.0));
+        // Falling 0.5 C in 5 s: raw D = 100 * 0.1 = 10 %, filtered 2.5 %.
+        assert_eq!(pid.update(30.0, 19.5, 5000), Some(2.5));
+        // Steady: the filtered term decays instead of dropping to zero.
+        assert!((pid.update(30.0, 19.5, 10_000).unwrap() - 1.875).abs() < 1e-9);
+        // Unfiltered: full raw step, then zero.
+        let mut raw = Pid::new(PidConfig { d_filter_s: 0.0, ..cfg });
+        raw.update(30.0, 20.0, 0);
+        assert_eq!(raw.update(30.0, 19.5, 5000), Some(10.0));
+        assert_eq!(raw.update(30.0, 19.5, 10_000), Some(0.0));
+        // A held gap restarts the filter: no stale derivative.
+        pid.hold();
+        assert_eq!(pid.update(30.0, 19.5, 15_000), Some(0.0));
+        assert_eq!(pid.d_filter_milli(), 15_000);
+        assert!(!Pid::new(PidConfig { d_filter_s: f64::NAN, ..cfg }).valid());
+    }
+
+    #[test]
+    fn d_filter_setter_range_checked() {
+        let mut control = HeaterControl::new(legacy(), None);
+        assert_eq!(HeaterControl::new(PidConfig::default(), None).d_filter_milli(), DEFAULT_D_FILTER_MILLI);
+        assert!(control.set_d_filter(0));
+        assert!(control.set_d_filter(*D_FILTER_RANGE_MILLI.end()));
+        assert!(!control.set_d_filter(*D_FILTER_RANGE_MILLI.end() + 1));
+        assert_eq!(control.d_filter_milli(), *D_FILTER_RANGE_MILLI.end());
+    }
+
+    #[test]
     fn invalid_numeric_and_duplicate_samples_rejected() {
-        let mut pid = Pid::new(PidConfig::default());
+        let mut pid = Pid::new(legacy());
         assert_eq!(pid.update(f64::NAN, 20.0, 0), None);
         assert_eq!(pid.update(25.0, f64::INFINITY, 0), None);
         assert!(pid.update(25.0, 20.0, 1000).is_some());
         assert_eq!(pid.update(25.0, 20.0, 1000), None);
         assert_eq!(pid.update(25.0, 20.0, 999), None);
-        let mut pid = Pid::new(PidConfig { kp: -1.0, ..PidConfig::default() });
+        let mut pid = Pid::new(PidConfig { kp: -1.0, ..legacy() });
         assert_eq!(pid.update(25.0, 20.0, 0), None);
     }
 
@@ -591,7 +676,7 @@ mod tests {
 
     #[test]
     fn unconfigured_standby_calculates_but_never_drives() {
-        let mut control = HeaterControl::new(PidConfig::default(), None);
+        let mut control = HeaterControl::new(legacy(), None);
         control.sample(20_000, 0);
         assert_eq!(control.pid_output_pct(), Some(50.0)); // kp=10 x 5 C
         assert_eq!(control.mode(), "standby");
@@ -820,13 +905,12 @@ mod tests {
     }
 
     #[test]
-    fn temperature_above_target_after_the_reset_drops_the_integral() {
+    fn temperature_well_above_target_after_the_reset_cuts_heat() {
         let (mut control, mut ms) = heating_with_integral(8);
         control.sensor_resetting();
         ms += 20_000;
         control.sample(26_000, ms); // warmed up meanwhile
-        assert_eq!(control.pid_output_pct(), Some(0.0));
-        assert_eq!(control.pid_integral_pct(), 0.0, "no heat demanded above target");
+        assert_eq!(control.pid_output_pct(), Some(0.0), "no heat at target + 1 C");
     }
 
     #[test]
@@ -843,7 +927,7 @@ mod tests {
     #[test]
     fn pid_gains_are_validated_and_applied() {
         let mut control = configured();
-        assert_eq!(control.pid_gains_milli(), (DEFAULT_KP_MILLI, DEFAULT_KI_MILLI, DEFAULT_KD_MILLI));
+        assert_eq!(control.pid_gains_milli(), (10_000, 100, 0));
         for bad in [(100_001, 100, 0), (10_000, 2_001, 0), (10_000, 100, 200_001)] {
             assert!(!control.set_pid_gains(bad.0, bad.1, bad.2), "{bad:?}");
         }
@@ -930,7 +1014,7 @@ mod tests {
         off.restore_desired(false);
         for ms in [0, 800, 1600, 2400] { off.sample(24_000, ms); }
         assert_eq!(off.mode(), "stopped");
-        let mut control = HeaterControl::new(PidConfig::default(), None);
+        let mut control = HeaterControl::new(legacy(), None);
         control.restore_desired(true);
         for ms in [0, 800, 1600] { control.sample(24_000, ms); }
         assert!(!control.enabled());
@@ -990,7 +1074,7 @@ mod tests {
         assert!(control.set_max_temperature(27_000), "lowering below the reading is allowed");
         assert_eq!(control.fault(), Some(Fault::OverTemperature));
         assert!(!control.tick(1601), "and cuts the heater immediately");
-        let mut none = HeaterControl::new(PidConfig::default(), None);
+        let mut none = HeaterControl::new(legacy(), None);
         assert!(!none.set_max_temperature(35_000), "cannot enable heating via the limit");
     }
 
@@ -1015,11 +1099,11 @@ mod tests {
 
     #[test]
     fn target_validated_against_safety_margin() {
-        let mut control = HeaterControl::new(PidConfig::default(),
+        let mut control = HeaterControl::new(legacy(),
             Some(SafetyLimits { max_temperature_mc: 35_000, heater_watts: 100 }));
         assert!(control.set_target(30_000));
         assert!(control.safety_configured());
-        let mut tight = HeaterControl::new(PidConfig::default(),
+        let mut tight = HeaterControl::new(legacy(),
             Some(SafetyLimits { max_temperature_mc: 27_000, heater_watts: 100 }));
         assert!(!tight.set_target(26_000));
         assert!(tight.set_target(25_000));
@@ -1043,5 +1127,31 @@ mod tests {
         let control = configured();
         assert!(!control.enabled());
         assert_eq!(control.mode(), "standby");
+    }
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+
+    #[test]
+    fn factory_defaults_are_valid_and_in_range() {
+        let pid = Pid::new(PidConfig::default());
+        assert!(pid.valid());
+        assert_eq!(pid.gains_milli(), (DEFAULT_KP_MILLI, DEFAULT_KI_MILLI, DEFAULT_KD_MILLI));
+        assert!(KP_RANGE_MILLI.contains(&DEFAULT_KP_MILLI) && KI_RANGE_MILLI.contains(&DEFAULT_KI_MILLI)
+            && KD_RANGE_MILLI.contains(&DEFAULT_KD_MILLI) && D_FILTER_RANGE_MILLI.contains(&DEFAULT_D_FILTER_MILLI));
+        assert_eq!(pid.d_filter_milli(), DEFAULT_D_FILTER_MILLI);
+    }
+
+    #[test]
+    fn default_d_term_on_one_lsb_step_is_small() {
+        // One 0.0625 C drop between two 5 s samples at the setpoint offset.
+        let mut pid = Pid::new(PidConfig::default());
+        pid.update(25.0, 24.9375, 0);
+        let base = pid.update(25.0, 24.9375, 5000).unwrap();
+        let stepped = pid.update(25.0, 24.875, 10_000).unwrap();
+        let d_kick = stepped - base - 20.0 * 0.0625; // remove the P change
+        assert!(d_kick > 0.0 && d_kick < 0.3, "filtered D kick {d_kick}");
     }
 }

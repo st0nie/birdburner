@@ -10,7 +10,7 @@ const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const normal = {
   target_c: 25, temperature_c: 24.87, last_good_temperature_c: 24.87,
   commanded_duty_pct: 18, pid_output_pct: 18.2, max_output_pct: 100,
-  max_temperature_c: 35, pid_kp: 10, pid_ki: 0.1, pid_kd: 0,
+  max_temperature_c: 35, pid_kp: 10, pid_ki: 0.1, pid_kd: 0, pid_d_filter_s: 30,
   mode: 'pid', pid_enabled: true, desired_enabled: true, fault: null,
   sensor: 'ok', sensor_reset_attempt: 0, sensor_power_cycles: 25,
   sample_hz: 1.5, window_ok_reads: 8, window_failed_reads: 2,
@@ -103,9 +103,10 @@ test('rejected PID does not erase a draft; defaults are draft-only', async () =>
   assert.equal(h.el('pidmsg').className,'local-feedback error');
   h.el('defaults').onclick();
   assert.equal(calls,1,'defaults do not apply without explicit confirmation');
-  assert.equal(h.el('kp').value,10);
-  assert.equal(h.el('ki').value,0.1);
-  assert.equal(h.el('kd').value,0);
+  assert.equal(h.el('kp').value,20);
+  assert.equal(h.el('ki').value,0.02);
+  assert.equal(h.el('kd').value,120);
+  assert.equal(h.el('tf').value,30);
 });
 
 test('offline values are marked not-live; reconnect restores normal state', async () => {
@@ -157,4 +158,18 @@ test('Stop cancels an in-flight Start and prevents a late Start retry', async ()
   assert.equal(starts,1);
   assert.equal(h.el('mode').textContent,'STOPPED');
   assert.equal(h.el('duty').textContent,'0');
+});
+
+test('D filter is edited with the PID form and sent with the gains', async () => {
+  const h = harness(); await flush();
+  h.context.input = {...normal}; h.run('render(input)');
+  assert.equal(h.el('tf').value, 30);
+  h.el('tf').value = '45'; h.el('tf').listeners.input();
+  assert.equal(h.el('pidsave').disabled, false);
+  let sent = null;
+  h.context.fetch = async (url, opts) => { sent = {url, body: JSON.parse(opts.body)}; return {ok:true, json: async () => ({...normal, pid_d_filter_s:45, settings_pending:true})}; };
+  h.el('pidform').listeners.submit({preventDefault() {}});
+  await flush(); await flush();
+  assert.equal(sent.url, '/api/pid');
+  assert.equal(sent.body.d_filter_s, 45);
 });
