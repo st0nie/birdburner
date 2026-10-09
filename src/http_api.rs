@@ -10,7 +10,7 @@ use picoserve::{
     routing::{get, post, PathRouter},
 };
 use crate::{
-    heater_control::{Fault, HeaterControl, PidConfig, SafetyLimits, LIMIT_RANGE_MC, MAX_OUTPUT_RANGE_PCT, PWM_WINDOW_MS, SAMPLE_WINDOW_MS, STEP_MC, TARGET_RANGE_MC},
+    heater_control::{Fault, HeaterControl, PidConfig, SafetyLimits, LIMIT_RANGE_MC, MAX_OUTPUT_RANGE_PCT, KD_RANGE_MILLI, KI_RANGE_MILLI, KP_RANGE_MILLI, PWM_WINDOW_MS, SAMPLE_WINDOW_MS, STEP_MC, TARGET_RANGE_MC},
     persist::Settings,
     sensor_display::{DisplayTemperature, SensorDisplay},
     sensor_recovery::{Event, PowerCycle, SensorRecovery},
@@ -35,6 +35,10 @@ pub struct AppState {
     /// Set whenever persisted settings change; the storage task clears it.
     pub settings_dirty: bool,
     pub storage_ok: bool,
+    /// Flash save in progress (dirty remains true during debounce).
+    settings_saving: bool,
+    /// Recovery produced a raw reading, but its 5 s control average is not ready yet.
+    awaiting_average: bool,
     // Monotonic counters for /metrics (reset only by reboot; see uptime).
     pub sensor_errors_total: u64,
     /// Failed reads by cause: no_presence, crc, bad_data, sensor_reset, timing, power.
@@ -61,11 +65,13 @@ impl AppState {
         control.set_target(saved.target_mc);
         control.set_max_temperature(saved.max_temperature_mc);
         control.set_max_output(saved.max_output_pct);
+        control.set_pid_gains(saved.kp_milli, saved.ki_milli, saved.kd_milli);
         control.restore_desired(saved.desired_enabled);
         Self {
             control, sensor: SensorDisplay::default(), recovery: SensorRecovery::new(), temperature_mc: None,
             wifi_connected: false, ip: None, relay_closed: false, now_ms: 0,
             sample_seq: 0, sample_hz: 0.0, settings_dirty: false, storage_ok: true,
+            settings_saving: false, awaiting_average: false,
             sensor_errors_total: 0, relay_on_ms_total: 0,
             sensor_errors_by_kind: [("no_presence", 0), ("crc", 0), ("bad_data", 0), ("sensor_reset", 0), ("timing", 0), ("power", 0)], relay_switches_total: 0,
             storage_writes_total: 0, storage_failures_total: 0, last_tick_ms: None,
@@ -74,11 +80,37 @@ impl AppState {
     }
 
     pub fn settings(&self) -> Settings {
+        let (kp_milli, ki_milli, kd_milli) = self.control.pid_gains_milli();
         Settings {
             target_mc: self.control.target_mc(),
             desired_enabled: self.control.desired_enabled(),
             max_temperature_mc: self.control.max_temperature_mc().unwrap_or(crate::persist::DEFAULT_MAX_MC),
             max_output_pct: self.control.max_output_pct(),
+            kp_milli, ki_milli, kd_milli,
+        }
+    }
+
+    /// Change the PID gains (thousandths); marks the settings dirty if they changed.
+    pub fn mutate_gains(&mut self, kp: u32, ki: u32, kd: u32) -> bool {
+        self.mutate(|c| c.set_pid_gains(kp, ki, kd))
+    }
+
+    /// Called after storage debounce. Pending stays true until verification completes.
+    pub fn take_settings_to_save(&mut self) -> Option<Settings> {
+        if !self.settings_dirty || self.settings_saving { return None; }
+        self.settings_dirty = false;
+        self.settings_saving = true;
+        Some(self.settings())
+    }
+
+    /// Flash writer reports read-back verification; a failure schedules another attempt.
+    pub fn finish_settings_save(&mut self, ok: bool) {
+        self.settings_saving = false;
+        self.storage_ok = ok;
+        self.storage_writes_total += 1;
+        if !ok {
+            self.storage_failures_total += 1;
+            self.settings_dirty = true;
         }
     }
 
@@ -97,7 +129,10 @@ impl AppState {
         self.window_sum_mc += mc as i64;
         self.window_ok += 1;
         self.sample_seq += 1;
-        self.recovery.good_read().is_some()
+        self.mutate(|c| c.recovery_raw_reading(mc));
+        let back = self.recovery.good_read().is_some();
+        self.awaiting_average |= back;
+        back
     }
 
     /// One failed raw read. Ignored for control unless the whole window fails.
@@ -134,18 +169,25 @@ impl AppState {
     pub fn sample(&mut self, mc: i32, ms: u64) {
         self.now_ms = ms;
         self.temperature_mc = Some(mc);
+        self.awaiting_average = false;
         self.sensor.success(mc);
         self.mutate(|c| c.sample(mc, ms));
     }
 
     /// A whole window without a single good read. The probe is power-cycled first (see
-    /// `sensor_recovery`): the heater is held off meanwhile, but no fault is raised until
-    /// every reset attempt has failed.
+    /// `sensor_recovery`): a running heater holds its last duty for bounded recovery; standby
+    /// or stopped heaters stay off. No new sensor fault until the attempts fail or age expires.
     pub fn window_failed(&mut self, ms: u64) {
         self.now_ms = ms;
         self.temperature_mc = None;
+        self.awaiting_average = false;
         self.sensor.error();
         let event = self.recovery.window_failed(ms);
+        if event.is_none() {
+            // Empty windows must interrupt startup/fault recovery's consecutive-good count too.
+            // A running heater already in bounded recovery keeps its duty and original deadline.
+            self.mutate(|c| c.sensor_resetting());
+        }
         self.apply_recovery(event);
     }
 
@@ -153,7 +195,8 @@ impl AppState {
         match event {
             Some(Event::AttemptStarted(_)) => self.mutate(|c| c.sensor_resetting()),
             Some(Event::GaveUp) => self.mutate(|c| c.sensor_error()),
-            // Heating resumes through the control's own 3-good-windows rule.
+            // A running heater continues at its held duty until the next average. Actual faults
+            // still recover through the control's 3-good-windows rule.
             Some(Event::Recovered) | None => {}
         }
     }
@@ -203,8 +246,13 @@ impl AppState {
         metric("pid_output_percent", "gauge", "PID computed output; absent when not computed.", c.pid_output_pct());
         metric("heater_duty_percent", "gauge", "Duty actually commanded to the SSR.", Some(c.commanded_duty_pct(self.now_ms)));
         metric("max_output_percent", "gauge", "User cap on heater duty.", Some(c.max_output_pct() as f64));
+        let (kp, ki, kd) = c.pid_gains_milli();
+        metric("pid_kp", "gauge", "PID proportional gain (percent per C).", Some(kp as f64 / 1000.0));
+        metric("pid_ki", "gauge", "PID integral gain (percent per C per second).", Some(ki as f64 / 1000.0));
+        metric("pid_kd", "gauge", "PID derivative gain (percent seconds per C).", Some(kd as f64 / 1000.0));
         metric("heater_on", "gauge", "1 while the SSR is commanded closed.", flag(self.relay_closed));
-        metric("control_enabled", "gauge", "1 while PID is driving the heater.", flag(c.enabled()));
+        metric("heater_output_held", "gauge", "1 while last output is held during bounded probe recovery.", flag(c.holding_through_reset()));
+        metric("control_enabled", "gauge", "1 while control is enabled (including bounded output hold).", flag(c.enabled()));
         metric("control_desired_enabled", "gauge", "1 if the user wants heating on (persisted).", flag(c.desired_enabled()));
         metric("wifi_connected", "gauge", "1 if associated to WiFi.", flag(self.wifi_connected));
         metric("storage_ok", "gauge", "1 if the last settings flash write succeeded.", flag(self.storage_ok));
@@ -240,7 +288,7 @@ impl AppState {
     pub fn temp_text(&self) -> String {
         // While the probe is being reset the last good value stays up with `*`; "Sensor Error"
         // is for a probe that is still silent after every reset.
-        if self.sensor.show_error() && !self.recovery.resetting() { return String::from("Sensor Error"); }
+        if self.sensor.show_error() && !self.recovery.resetting() && !self.awaiting_average { return String::from("Sensor Error"); }
         match self.sensor.last_good_mc() {
             Some(mc) => format!("{} C{}", DisplayTemperature(mc), if self.sensor.stale() { "*" } else { "" }),
             None => format!("Reading...{}", if self.sensor.stale() { "*" } else { "" }),
@@ -253,7 +301,8 @@ impl AppState {
             temperature_c: self.temperature_mc.map(|mc| mc as f64 / 1000.0),
             display: self.temp_text(),
             target_c: c.target_mc() as f64 / 1000.0,
-            sensor: if self.recovery.resetting() { "resetting" } else if self.sensor.stale() { "error" } else if self.temperature_mc.is_some() { "ok" } else { "reading" },
+            sensor: if self.recovery.resetting() { "resetting" } else if self.sensor.stale() && self.awaiting_average { "recovering" }
+                else if self.sensor.stale() { "error" } else if self.temperature_mc.is_some() { "ok" } else { "reading" },
             sensor_reset_attempt: self.recovery.attempt(),
             sensor_power_cycles: self.recovery.power_cycles_total(),
             last_good_temperature_c: self.sensor.last_good_mc().map(|mc| mc as f64 / 1000.0),
@@ -267,8 +316,12 @@ impl AppState {
             safety_configured: c.safety_configured(),
             max_temperature_c: c.max_temperature_mc().map(|mc| mc as f64 / 1000.0),
             max_output_pct: c.max_output_pct(),
+            pid_kp: c.pid_gains_milli().0 as f64 / 1000.0,
+            pid_ki: c.pid_gains_milli().1 as f64 / 1000.0,
+            pid_kd: c.pid_gains_milli().2 as f64 / 1000.0,
             start_blocked_by: c.check_start(self.now_ms).err().map(|e| e.label()),
-            storage_ok: self.storage_ok, sample_seq: self.sample_seq, sample_hz: self.sample_hz,
+            storage_ok: self.storage_ok, settings_pending: self.settings_dirty || self.settings_saving,
+            heater_output_held: c.holding_through_reset(), sample_seq: self.sample_seq, sample_hz: self.sample_hz,
             window_ok_reads: self.last_window.0, window_failed_reads: self.last_window.1,
             sample_window_ms: SAMPLE_WINDOW_MS,
         }
@@ -285,7 +338,9 @@ pub struct Status {
     pub pid_output_pct: Option<f64>, pub commanded_duty_pct: f64, pub pwm_window_ms: u64,
     pub fault: Option<&'static str>,
     pub safety_configured: bool, pub max_temperature_c: Option<f64>, pub max_output_pct: u8,
-    pub start_blocked_by: Option<&'static str>, pub storage_ok: bool,
+    pub pid_kp: f64, pub pid_ki: f64, pub pid_kd: f64,
+    pub start_blocked_by: Option<&'static str>, pub storage_ok: bool, pub settings_pending: bool,
+    pub heater_output_held: bool,
     pub sample_seq: u64, pub sample_hz: f64,
     pub window_ok_reads: u32, pub window_failed_reads: u32, pub sample_window_ms: u64,
 }
@@ -312,6 +367,19 @@ struct LimitRequest { max_temperature_c: f64 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MaxOutputRequest { max_output_pct: u8 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PidRequest { kp: f64, ki: f64, kd: f64 }
+
+/// Gain to thousandths: finite, rounded to 0.001, inside the allowed range.
+pub fn gain_milli(value: f64, range: core::ops::RangeInclusive<u32>) -> Option<u32> {
+    if !value.is_finite() || value < f64::from(*range.start()) / 1000.0
+        || value > f64::from(*range.end()) / 1000.0 { return None; }
+    // Non-negative, bounded value: truncation implements floor and works in no_std.
+    let milli = (value * 1000.0 + 0.5) as u32;
+    range.contains(&milli).then_some(milli)
+}
 
 /// Converts a Celsius value to milli-C if it is finite, on the 0.5 C grid and in range.
 fn grid_mc(celsius: f64, range: core::ops::RangeInclusive<i32>) -> Option<i32> {
@@ -393,6 +461,17 @@ async fn max_output(State(shared): State<Shared>, JsonBody(input): JsonBody<MaxO
     json(StatusCode::OK, &app.status())
 }
 
+async fn pid(State(shared): State<Shared>, JsonBody(input): JsonBody<PidRequest>) -> JsonResponse {
+    let (Some(kp), Some(ki), Some(kd)) = (
+        gain_milli(input.kp, KP_RANGE_MILLI), gain_milli(input.ki, KI_RANGE_MILLI), gain_milli(input.kd, KD_RANGE_MILLI),
+    ) else {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, "pid_gains_out_of_range_kp_0_100_ki_0_2_kd_0_200");
+    };
+    let mut app = shared.borrow_mut();
+    app.mutate_gains(kp, ki, kd);
+    json(StatusCode::OK, &app.status())
+}
+
 async fn metrics(State(shared): State<Shared>) -> impl IntoResponse {
     let body = shared.borrow().metrics();
     Response::ok(body).with_content_type("text/plain; version=0.0.4; charset=utf-8")
@@ -410,6 +489,7 @@ pub fn router(shared: Shared) -> picoserve::Router<impl PathRouter, ()> {
         .route("/api/target", post(target))
         .route("/api/limit", post(limit))
         .route("/api/max_output", post(max_output))
+        .route("/api/pid", post(pid))
         .route("/api/start", post(start))
         .route("/api/stop", post(stop))
         .with_state(shared)

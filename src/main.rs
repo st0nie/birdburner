@@ -72,7 +72,7 @@ fn read_slot(flash: &mut FlashStorage, i: usize) -> Option<(u32, Settings)> {
 fn load_settings(flash: &mut FlashStorage) -> (Settings, u32, usize) {
     match persist::choose([read_slot(flash, 0), read_slot(flash, 1)]) {
         Some((s, seq, slot)) => {
-            println!("[STORE] restored target={} limit={} max_out={}% desired_on={} (seq {})", s.target_mc, s.max_temperature_mc, s.max_output_pct, s.desired_enabled, seq);
+            println!("[STORE] restored target={} limit={} max_out={}% desired_on={} pid={}/{}/{} (seq {})", s.target_mc, s.max_temperature_mc, s.max_output_pct, s.desired_enabled, s.kp_milli, s.ki_milli, s.kd_milli, seq);
             (s, seq, 1 - slot)
         }
         None => {
@@ -94,25 +94,15 @@ fn write_slot(flash: &mut FlashStorage, slot: usize, seq: u32, s: Settings) -> b
 async fn storage_task(mut flash: FlashStorage, shared: Shared, mut seq: u32, mut slot: usize) {
     loop {
         Timer::after_millis(500).await;
-        {
-            let mut app = shared.borrow_mut();
-            if !app.settings_dirty { continue; }
-            app.settings_dirty = false;
-        }
-        // Debounce slider drags: wait, then save whatever is current.
+        if !shared.borrow().settings_dirty { continue; }
+        // Keep dirty set during debounce, so the page never confirms flash too early.
         Timer::after_millis(1500).await;
-        let s = shared.borrow().settings();
+        let Some(s) = shared.borrow_mut().take_settings_to_save() else { continue; };
         seq = seq.wrapping_add(1);
         let ok = write_slot(&mut flash, slot, seq, s);
         if ok { slot = 1 - slot; }
-        println!("[STORE] save target={} limit={} max_out={}% desired_on={} -> {}", s.target_mc, s.max_temperature_mc, s.max_output_pct, s.desired_enabled, if ok { "ok" } else { "FAILED" });
-        let mut app = shared.borrow_mut();
-        app.storage_ok = ok;
-        app.storage_writes_total += 1;
-        if !ok {
-            app.storage_failures_total += 1;
-            app.settings_dirty = true; // retry
-        }
+        println!("[STORE] save target={} limit={} max_out={}% desired_on={} pid={}/{}/{} -> {}", s.target_mc, s.max_temperature_mc, s.max_output_pct, s.desired_enabled, s.kp_milli, s.ki_milli, s.kd_milli, if ok { "ok" } else { "FAILED" });
+        shared.borrow_mut().finish_settings_save(ok);
     }
 }
 
@@ -249,8 +239,8 @@ async fn relay_task(mut pin: Output<'static>, shared: Shared) {
         }
         if now_phase != phase {
             match now_phase {
-                Phase::Healthy => println!("[SENSOR] answering again; heating resumes after 3 good windows"),
-                Phase::Resetting(n) => println!("[SENSOR] no valid reading for a whole window: heater held off, reset {}/{} (not a fault yet)", n, MAX_ATTEMPTS),
+                Phase::Healthy => println!("[SENSOR] answering again; next valid average resumes PID updates (fault recovery still requires 3 windows)"),
+                Phase::Resetting(n) => println!("[SENSOR] no valid reading for a whole window: reset {}/{} (not a fault; a running heater keeps its last output)", n, MAX_ATTEMPTS),
                 Phase::Failed => println!("[SENSOR] still silent after {} resets: FAULT sensor_error, retrying once a minute", MAX_ATTEMPTS),
             }
             phase = now_phase;
@@ -270,9 +260,10 @@ async fn oled_task(mut display: Oled, shared: Shared) {
             let c = &app.control;
             let state = match c.fault() {
                 Some(f) => format!("FAULT {}", f.label()),
-                None if app.recovery.resetting() => format!("Sensor reset {}/{}", app.recovery.attempt(), MAX_ATTEMPTS),
+                // A probe reset that the running heater rides through stays invisible here.
                 None if c.enabled() => format!("PID {:.0}% SSR:{}", c.commanded_duty_pct(app.now_ms),
                     if app.relay_closed { "on" } else { "off" }),
+                None if app.recovery.resetting() => format!("Sensor reset {}/{}", app.recovery.attempt(), MAX_ATTEMPTS),
                 None if c.desired_enabled() => format!("resuming {}/3", c.recovery_samples()),
                 None => format!("{}", c.mode()),
             };

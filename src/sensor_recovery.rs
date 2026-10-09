@@ -1,13 +1,13 @@
 //! Hardware recovery for a DS18B20 that stops answering.
 //!
-//! Failure seen on this build: the probe's 1-Wire interface keeps answering (presence and CRC are
-//! fine) but its conversion core is latched up. Nothing sent on the bus clears that; only removing
-//! VDD does. The probe's VDD is therefore fed from a GPIO and this state machine decides when to
-//! switch it off.
+//! The observed probe failure recovers after power removal but not an ESP32 RST. This motivates
+//! power cycling, without proving physical latch-up or a particular electrical cause. The
+//! probe's VDD is fed from a GPIO; this state machine decides when to switch it off.
 //!
 //! Policy: a whole averaging window without a valid reading starts a reset ladder (VDD off for
-//! 1 s, then 3 s, then 10 s). That is *not* a fault: the heater is held off meanwhile
-//! (`HeaterControl::sensor_resetting`) but nothing is reported as failed. The first valid reading
+//! 1 s, then 3 s, then 10 s). That is *not* a fault: `HeaterControl::sensor_resetting` holds a
+//! running heater's last output while leaving stopped/standby heaters off. Its independent
+//! measurement-age guard bounds output hold even if this supervisor stalls. The first valid reading
 //! ends the ladder. Only when every attempt has failed is the sensor declared faulty; the power
 //! cycle then repeats once a minute, so a probe that comes back heals itself.
 //!
@@ -40,7 +40,7 @@ pub enum Phase {
 /// What just changed; the caller applies it to the heater control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    /// A reset attempt started: hold the heater off, but do not raise a fault.
+    /// A reset attempt started: hold the current duty if already heating; do not raise a fault.
     AttemptStarted(u8),
     /// Every attempt failed: raise the sensor fault.
     GaveUp,

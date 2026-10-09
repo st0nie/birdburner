@@ -13,3 +13,6 @@ path = "lib.rs"
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 picoserve = { version = "=0.20.1", features = ["tokio", "json", "alloc"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "net", "io-util", "time"] }

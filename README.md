@@ -18,7 +18,7 @@
 
 ### Why the probe's VDD is on a GPIO
 
-On this build the DS18B20 occasionally **latches up**: after hours of normal operation its 1-Wire interface keeps answering (presence and CRC stay perfect) but it never converts again. Nothing sent on the bus clears that, and the ESP32's RST button does not either, because the probe stays powered; only removing its VDD does (unplugging the board's power was the only cure). So the probe is powered from **GPIO22**, and the firmware switches it off and on by itself.
+On this build the DS18B20 occasionally stops providing valid temperatures despite answering on the bus. The user observed that an ESP32 RST did not help, while a full power cycle did. That supports trying a probe power cycle; it does not by itself establish physical CMOS latch-up, a clone chip or a particular electrical cause. The probe is powered from **GPIO22** so the firmware can restart it without rebooting the controller.
 
 ### Wiring (adapter board, 2 m cable)
 
@@ -48,58 +48,60 @@ Moving an existing build over: pull the VCC wire off the **3V3** pin and put it 
 
 ### Recommended hardening at the probe end (parts cost a few cents)
 
-These stop the spikes that trigger a latch-up in the first place; the reset is the safety net, not a substitute.
+These can improve supply and signal integrity; the cause of the observed failures has not been measured electrically. Automatic recovery is a safety net, not a substitute for reliable wiring.
 
-1. **0.1 µF ceramic capacitor (marked `104`) across VDD–GND, soldered right at the probe's pins**, ideally with a 10 µF electrolytic in parallel (stripe = GND). It absorbs spikes and keeps the probe's own supply steady during a conversion, which a 2 m thin cable and Dupont contacts cannot.
-2. **100 Ω resistor in series with DATA, also at the probe end.** It limits the current a spike can inject into the pin and does not disturb 1-Wire timing.
+1. **0.1 µF ceramic capacitor (marked `104`) across VDD–GND, close to the probe's pins**, optionally with a 10 µF capacitor in parallel (electrolytic stripe = GND). This improves local decoupling. If the probe and cable are sealed, do not cut open the waterproof seal just to add parts; use a suitable replacement probe or accessible termination.
+2. A **100 Ω resistor in series with DATA** can limit transient current, but it also affects the bus waveform. Verify successful readings after fitting it; it is not a universal fix.
 3. **Route the cable away from mains and the SSR**: at least 10–15 cm apart, crossing at 90° where unavoidable, never bundled with the 220 V wiring.
 4. Solder (or use proper terminals) at the probe end and heat-shrink every joint; Dupont contacts corrode in a damp cage.
-5. A genuine Maxim DS18B20 (authorised distributor, part number `DS18B20+`) is much harder to latch than the unbranded clones sold with waterproof probes.
+5. If failures continue, try a probe from a traceable supplier. A `DS18B20+` marking alone does not establish authenticity.
 
 ### What the firmware does
 
-A **5 s window without a single valid reading** is the trigger (isolated bad reads inside a window are tolerated as before). The heater is cut at once, as it always was, but this is **not reported as a fault**:
+A **5 s window without a single valid reading** is the trigger (isolated bad reads inside a window are tolerated as before). From then on the probe is power-cycled, and **a running heater does not notice**: it keeps going on its last PID output (same duty, same 2 s PWM windows), the page keeps saying *Heating*, the OLED keeps its `PID n% SSR:..` line and nothing is reported as a fault.
 
-| Step | VDD off | Waits for a valid reading | OLED line 3 |
-| --- | --- | --- | --- |
-| reset 1 | 1 s | up to 6 s | `Sensor reset 1/3` |
-| reset 2 | 3 s | up to 6 s | `Sensor reset 2/3` |
-| reset 3 | 10 s | up to 6 s | `Sensor reset 3/3` |
-| still silent | - | - | `FAULT sensor_error`, temperature line `Sensor Error` |
+| Step | VDD off | Waits for a valid reading |
+| --- | --- | --- |
+| reset 1 | 1 s | up to 6 s |
+| reset 2 | 3 s | up to 6 s |
+| reset 3 | 10 s | up to 6 s |
+| still silent | - | the heater is cut and `FAULT sensor_error` is shown (temperature line `Sensor Error`) |
 
-- The **first valid reading ends the sequence**; the heater then resumes after 3 good 5 s windows (`resuming 1/3`, `2/3`, then PID). When the first reset works, heating is back roughly 15 s after the silent window was detected, and the heater stays off the whole time.
-- While resetting, the temperature line keeps the last good value with a `*`.
-- **The PID integral is kept** across a reset that works (the heater was running), so heating resumes at the output it had learned instead of ramping up from zero and letting the cage sag. Nothing is integrated during the gap. If the resets fail (`sensor_error`), or on any other fault, stop, start or target change, the PID starts from scratch as before.
-- Only if all three resets fail is `sensor_error` raised (about 32 s after the first silent window). The power cycle then **repeats once a minute** (VDD off 3 s) without clearing the fault, so a probe that comes back (re-plugged, power glitch) recovers by itself.
+- The **first valid raw reading ends the reset sequence** at any step. Normal PID updates resume at the next valid 5 s average: no 3-window wait, no PID restart, the integral is kept and the gap is not integrated. Until that average arrives the heater keeps its held output; the API reports `sensor:"recovering"`, not an error.
+- A sensor failure cuts the heater **after all three resets fail** (normally about 32 s after the first silent window). An independent **45 s maximum measurement-age guard** also cuts it if recovery stalls; reset attempts do not extend that deadline. This deliberately allows bounded open-loop heating at the last duty while no new temperature is available, so the software cannot detect a new over-temperature during that interval. Existing faults, manual Stop and a newly observed over-temperature still take priority. Keep the independent hardware thermal cutout in place.
+- If the heater was not running (stopped, standby, already faulted) the reset simply keeps it off; the OLED then shows `Sensor reset n/3` and the page the reset progress.
+- The temperature line keeps the last good value with a `*` (it is a few seconds old).
+- If all three resets fail, `sensor_error` is raised and the PID is wiped like for any fault. The power cycle then **repeats once a minute** (VDD off 3 s) without clearing the fault, so a probe that comes back recovers after 3 good windows. A measurement-age timeout reports `sensor_stale` instead; both keep the heater off.
 - Each power cycle holds DATA low together with VDD. Otherwise the pull-ups would feed the chip through its input protection diode and a latched probe would never lose power.
-- The reset needs no network and runs even while the page is unreachable. A manual **Stop** is kept through a reset; the on/off choice is never changed.
+- The reset needs no network and runs even while the page is unreachable. A manual **Stop**, a target change or a new limit during a reset behave as usual; the on/off choice is never changed by a reset.
 
 Where to see it:
 
 | Where | What |
 | --- | --- |
-| OLED line 3 | `Sensor reset n/3` while resetting, `FAULT sensor_error` after giving up |
-| `/api/status` | `"sensor":"resetting"`, `sensor_reset_attempt` (1-3), `sensor_power_cycles` (since boot); `fault` stays `null` until the resets fail |
+| OLED line 3 | Nothing while a running heater rides through the reset (`PID n% SSR:..`); `Sensor reset n/3` if the heater was off; `FAULT sensor_error` after giving up |
+| `/api/status` | `"sensor":"resetting"`, `sensor_reset_attempt` (1-3), `sensor_power_cycles` (since boot); `mode` stays `pid` and `fault` stays `null` while the heater rides through, `fault` appears only when the resets fail (diagnostic fields, not shown on the page) |
 | `/metrics` | `birdburner_sensor_resetting`, `birdburner_sensor_power_cycles_total`, `birdburner_sensor_recoveries_total` |
 | Serial log | `[SENSOR] ...` phase changes and `[DS18B20] no valid reading: power-cycling the probe (reset 1/3, VDD off 1000 ms)` |
 
-Timings are constants at the top of `src/sensor_recovery.rs` (`OFF_MS`, `RESPONSE_MS`, `RETRY_MS`, `RETRY_OFF_MS`, `MAX_ATTEMPTS`).
+Reset timings are constants at the top of `src/sensor_recovery.rs` (`OFF_MS`, `RESPONSE_MS`, `RETRY_MS`, `RETRY_OFF_MS`, `MAX_ATTEMPTS`); the independent age guard is `SENSOR_RESET_MAX_AGE_MS` in `src/heater_control.rs`.
 
 ### Checking the wiring after the change
 
-1. **VCC really comes from GPIO22**: with the firmware running, pull the VCC wire. Readings must stop and the OLED must show `Sensor reset 1/3` within about 10 s (a probe still reading with VCC pulled is not powered from GPIO22). Put the wire back: it recovers on its own, no `FAULT` is shown.
-2. **Reset path**: unplug DATA for about 10 s and plug it back. Expect `Sensor reset 1/3` (maybe `2/3`), no `FAULT`, and `sensor_power_cycles` increasing. Keep it unplugged for 40 s or more and `FAULT sensor_error` appears; plug it back and it clears after the probe answers and 3 good windows.
-3. The heater is off during both tests by design; watch `/api/status` (`curl http://<IP>/api/status`) or the serial log.
+1. **With mains power disconnected**, check that the adapter VCC wire is connected to GPIO22 rather than 3V3. Only the low-voltage board should be powered for subsequent tests. Removing VCC alone is not a definitive test because DATA can parasitically power some probes.
+2. **Reset path**: with heating stopped, disconnect DATA for about 10 s and reconnect it. Expect `Sensor reset 1/3` (possibly `2/3`), no fault, and `sensor_power_cycles` increasing. Disconnect it for 45 s and a sensor fault must appear; reconnect it and the fault clears after 3 good windows.
+3. To verify PWM continuity, use an empty enclosure and a monitored test load. A short recovery must keep the commanded duty and the `pid` state; prolonged failure must force duty to zero. Stop must work during recovery. Do not run these tests with birds inside.
 
-This proves the wiring and the supervision logic. A real latch-up cannot be provoked on demand: if one happens, `sensor_power_cycles_total` and `sensor_recoveries_total` in `/metrics` will have counted it.
+This checks recovery supervision; it does not prove a specific physical failure mechanism. `sensor_power_cycles_total` and `sensor_recoveries_total` count recovery activity.
 
 ## Firmware
 
 - Rust `no_std` + Embassy; HTTP served by **picoserve** (4 workers), phone control page embedded (`src/index.html`).
-- DS18B20 at **12-bit (0.0625 °C)**, displayed with two decimals. Readings are averaged per 5 s window: any successful reads in a window are averaged into one control sample and failed reads are dropped. A window with zero successful reads cuts the heater and first triggers an automatic **probe power reset** (see above); only if three resets fail is it a fault.
+- DS18B20 at **12-bit (0.0625 °C)**, displayed with two decimals. Readings are averaged per 5 s window: any successful reads in a window are averaged into one control sample and failed reads are dropped. A window with zero successful reads first triggers an automatic **probe power reset** (see above) with the heater carrying on; only if three resets fail is the heater cut and a fault reported.
 - PID (heat-only) drives the SSR as **2 s time-proportional PWM** (not kHz PWM). Target 15–30 °C in 0.5 °C steps; default 25 °C.
 - Software safety limit default **35 °C** (adjustable 25–40 °C on the web page, must exceed the target by ≥2 °C). At the limit the heater cuts off instantly; it resumes automatically 3 °C below the limit (hysteresis).
-- **Persistent settings** (target, safety limit, max output, on/off intent) survive power cuts (dual-sector, CRC-checked). Temperature readings and faults are never persisted.
+- **Persistent settings** (target, safety limit, max output, PID gains, on/off intent) survive power cuts (dual-sector, CRC-checked). Temperature readings and faults are never persisted.
+- A probe power reset (see above) is not a fault and does not interrupt a running heater; only when it fails is the heater cut.
 - Every fault cuts the heater and recovers automatically — there is no permanent lockout: sensor errors (after the resets failed) recover once the probe answers and 3 good windows follow; over-temperature recovers below limit−3 °C. After a power cut the heater stays off until 3 good samples, then resumes the saved on/off intent.
 - SSR command Open/Closed is a software command only; there is no load-current feedback.
 
@@ -114,37 +116,36 @@ cp src/secrets.example.rs src/secrets.rs   # then fill in SSID / PASSWORD
 ## Phone control
 
 1. Connect the phone to the same WiFi, open the IP shown on the OLED bottom line (e.g. `http://192.168.50.135`).
-2. Drag the slider to set the target temperature; releasing saves it to flash.
-3. Tap **Start heating**. Status shows `Heating`, the output shows the actual duty.
+2. In **Operating limits**, enter a temperature setpoint and press its **Set** button.
+3. Tap **Start**. Status shows `AUTO / HEATING`; the output shows the commanded duty.
 4. **Stop heating** opens the SSR immediately and saves the off intent.
-5. Faults recover automatically; the page shows the cause and recovery progress.
-6. The **Max output** slider (10–100 %) caps heater power; the **Safety limit** slider (25–40 °C) sets the over-temperature cutoff. Both persist.
+5. Faults recover automatically; the alarm explains the cause. A short probe reset preserves the running status; cached temperatures have a `*`. A lost network connection is marked **OFFLINE**, not confused with a probe failure.
+6. **Maximum output** (10–100 %) caps duty; **Temperature cutoff** (25–40 °C) sets the over-temperature threshold. Set each independently.
+7. **PID parameters** accepts Kp/Ki/Kd together via **Apply PID**. Drafts are not overwritten by status polling. **Load defaults** only edits the form; it does not send values until Apply.
+8. Save feedback appears in the panel that was changed. It says saving while a flash write is pending, then confirms success for 4 s. Wait for the success confirmation before RST or removing power. An HTTP success means applied in RAM, not necessarily already stored in flash.
 
-OLED line 3 `PID 7% SSR:off` means the PID is running at 7 % duty and the SSR happens to be in the off part of its 2 s window. `resuming 1/3` means it is waiting for fresh valid readings before heating again. `Sensor reset 1/3` means the probe stopped answering and is being power-cycled (heater off, not a fault yet).
+OLED line 3 `PID 7% SSR:off` means the PID is running at 7 % duty and the SSR happens to be in the off part of its 2 s window. `resuming 1/3` means it is waiting for fresh valid readings before heating again. `Sensor reset 1/3` (only shown while the heater is off) means the probe stopped answering and is being power-cycled, not a fault yet; a running heater keeps its `PID` line during a reset.
 
 ## PID tuning
 
-Edit **`src/heater_control.rs` → `impl Default for PidConfig`**:
+Tune from the phone page: the **PID parameters** panel has Kp, Ki and Kd boxes and an **Apply PID** button. The values are applied from the next 5 s sample and **saved to flash** (they survive power cuts, like the other settings). The same over HTTP: `POST /api/pid {"kp":10,"ki":0.1,"kd":0}` (see [APIDOC.md](APIDOC.md)); the current values are in `/api/status` (`pid_kp`, `pid_ki`, `pid_kd`) and `/metrics` (`birdburner_pid_kp/ki/kd`), handy to overlay on the Grafana curves.
 
-```rust
-Self { kp: 10.0, ki: 0.1, kd: 0.0, output_limit_pct: DEFAULT_MAX_OUTPUT_PCT as f64 }
-```
+These are **provisional, not tuned** on this cage. Factory values: Kp 10, Ki 0.1, Kd 0 (flash records written before this feature load with them).
 
-These are **provisional, not tuned** on this cage:
+| Field | Meaning / unit | Allowed |
+| --- | --- | --- |
+| Kp | Proportional gain, output %/°C | 0–100 |
+| Ki | Integral gain, output %/(°C·s) | 0–2 |
+| Kd | Derivative gain (on measurement), output %·s/°C | 0–200 |
 
-| Field | Meaning / unit |
-| --- | --- |
-| `kp` | Proportional gain, output %/°C |
-| `ki` | Integral gain, output %/(°C·s) |
-| `kd` | Derivative gain (on measurement), output %·s/°C |
-| `output_limit_pct` | Duty cap used on first boot only; afterwards the persisted "Max output" slider value (10–100 %) applies |
+Values are kept to 0.001. **Maximum output** (10–100 %) is the duty cap; the integral is clamped to it. Changing gains retains the integral unless Ki is set to zero, which clears it; gains can still change the output at the next sample. The factory defaults live in `src/heater_control.rs` (`DEFAULT_KP_MILLI`, `DEFAULT_KI_MILLI`, `DEFAULT_KD_MILLI`, in thousandths).
 
 Same file, at the top:
 
 - `PWM_WINDOW_MS = 2000`: SSR time window (30 % ≈ 600 ms on / 1400 ms off).
 - `MIN_AC_PULSE_MS = 20`: pulse quantisation for 50 Hz mains.
 - `SAMPLE_WINDOW_MS = 5000`: one control sample per 5 s averaging window.
-- `SENSOR_MAX_AGE_MS = 12_000`: sample older than this cuts the heater.
+- `SENSOR_MAX_AGE_MS = 12_000`: sample older than this cuts the heater (except while a probe power reset is bridging it, see above).
 
 Tuning order: set real safety limits and verify wiring first; start with `ki=0`, `kd=0`, tune `kp`; add `ki` only to remove steady-state offset; change one parameter at a time and watch the response.
 
@@ -198,6 +199,7 @@ curl http://$IP/api/status
 curl http://$IP/metrics
 curl -X POST http://$IP/api/target     -H 'Content-Type: application/json' -d '{"target_c":25.5}'
 curl -X POST http://$IP/api/max_output -H 'Content-Type: application/json' -d '{"max_output_pct":100}'
+curl -X POST http://$IP/api/pid        -H 'Content-Type: application/json' -d '{"kp":10,"ki":0.1,"kd":0}'
 curl -X POST http://$IP/api/limit      -H 'Content-Type: application/json' -d '{"max_temperature_c":35}'
 curl -X POST http://$IP/api/start
 curl -X POST http://$IP/api/stop
@@ -219,7 +221,7 @@ No authentication/TLS — trusted LAN only, do not expose to the Internet.
 | Display cache, `*` marker, 5-failure rule | `src/sensor_display.rs` |
 | Serial reset/read tool | `tools/espmon.c` |
 
-`[OLED] write error` = I2C failure (the firmware retries init once a second); check GPIO6/7 wiring and power. `[DS18B20]` errors: check DATA on GPIO23, VCC on GPIO22, common ground and the ~4.7 kΩ pull-up; keep the cable straight, uncoiled and away from mains wiring. Occasional CRC errors are tolerated by the 5 s averaging window; a window with zero successful reads cuts the heater and starts the probe power reset, and the heater stays off until readings are good again. Repeated resets (`birdburner_sensor_power_cycles_total` climbing) mean the probe or its cable/supply is unhealthy: apply the hardening list above. `sensor_errors_by_kind_total` tells the story: a latched probe shows `timing` and `bad_data` growing with `no_presence`, `crc` and `power` at 0; a loose wire shows `no_presence`.
+`[OLED] write error` = I2C failure (the firmware retries init once a second); check GPIO6/7 wiring and power. `[DS18B20]` errors: check DATA on GPIO23, VCC on GPIO22, common ground and the ~4.7 kΩ pull-up; keep the cable straight, uncoiled and away from mains wiring. Occasional CRC errors are tolerated by the 5 s averaging window; a window with zero successful reads starts probe recovery. A running heater retains its last duty for the bounded recovery interval; unsuccessful recovery or the independent age timeout cuts it. Repeated resets (`birdburner_sensor_power_cycles_total` climbing) mean the probe or its cable/supply is unhealthy: apply the hardening list above. `sensor_errors_by_kind_total` helps locate the failure class: `timing` includes early completion and timeout, `bad_data` is a rejected scratchpad, and `no_presence` means no reset response. These counters alone do not identify the electrical cause.
 
 Standalone diagnostic firmware (flashing them replaces the main firmware):
 
@@ -233,4 +235,7 @@ Host-side logic tests (no device, no GPIO):
 ```sh
 cargo test --manifest-path tests/host/Cargo.toml \
   --target x86_64-unknown-linux-gnu --target-dir target/host-tests
+node --test tests/frontend.test.mjs
 ```
+
+Host tests cover control/recovery, flash-record migration, and the real picoserve API over loopback TCP. The dependency-free frontend tests cover polling, feedback, request retries, drafts and Stop preemption. Physical flash/GPIO/thermal behaviour must still be checked on the board.

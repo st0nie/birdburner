@@ -8,6 +8,9 @@ extern crate alloc;
 #[path = "../../src/http_api.rs"] pub mod http_api;
 
 #[cfg(test)]
+mod http_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{heater_control::SafetyLimits, http_api::AppState, persist::Settings, sensor_recovery::Phase};
 
@@ -129,7 +132,7 @@ mod tests {
 
     #[test]
     fn saved_limit_restored_and_changes_mark_dirty() {
-        let saved = Settings { target_mc: 22_000, desired_enabled: false, max_temperature_mc: 26_000, max_output_pct: 60 };
+        let saved = Settings { target_mc: 22_000, desired_enabled: false, max_temperature_mc: 26_000, max_output_pct: 60, ..Settings::default() };
         let mut app = AppState::new(LIMITS, saved);
         assert_eq!(app.control.max_temperature_mc(), Some(26_000));
         assert_eq!(app.control.max_output_pct(), 60);
@@ -170,89 +173,101 @@ mod tests {
         (app, ms)
     }
 
+    /// Ticks every 100 ms like the relay task; from `read_at` on the probe delivers a good raw
+    /// read every 700 ms. The sensor task performs every power cycle it is handed. Returns the
+    /// number of ticks with the SSR closed and the power cycles `(attempt, VDD-off ms)`.
+    /// Asserts `check` on every tick.
+    fn run(app: &mut AppState, ms: &mut u64, until: u64, read_at: Option<u64>, check: &dyn Fn(&AppState, u64)) -> (u64, Vec<(u8, u64)>) {
+        let mut closed = 0;
+        let mut cycles = Vec::new();
+        let mut next_read = read_at;
+        while *ms < until {
+            *ms += 100;
+            if next_read.is_some_and(|t| *ms >= t) { app.raw_reading(22_100, *ms); next_read = Some(*ms + 700); }
+            if app.tick(*ms) { closed += 1; }
+            if let Some(c) = app.take_power_cycle() { cycles.push((c.attempt, c.off_ms)); }
+            check(app, *ms);
+        }
+        (closed, cycles)
+    }
+
     #[test]
-    fn probe_reset_that_works_never_shows_a_fault_and_heating_resumes() {
+    fn probe_reset_that_works_is_invisible_and_the_heater_never_stops() {
         let (mut app, mut ms) = running_app();
+        let t0 = ms;
+        run(&mut app, &mut ms, t0 + 2_000, None, &|_, _| {});
         assert!(app.control.commanded_duty_pct(ms) > 0.0);
         assert_eq!(app.status().sensor, "ok");
 
-        // The probe latches up: a whole window without a reading.
-        ms += 5_000;
-        app.tick(ms);
-        let failed_at = ms;
-        assert_eq!(app.control.fault(), None, "a reset is tried before any fault is reported");
-        assert_eq!(app.control.mode(), "standby");
-        assert_eq!(app.control.commanded_duty_pct(ms), 0.0, "heater held off meanwhile");
-        assert!(!app.tick(ms));
-        let status = app.status();
-        assert_eq!((status.sensor, status.sensor_reset_attempt, status.fault), ("resetting", 1, None));
-        assert_eq!(status.start_blocked_by, Some("sensor_not_ready"), "no manual start on a silent probe");
-        assert_eq!(app.temp_text(), "22.00 C*");
-        let cycle = app.take_power_cycle().expect("the sensor task is told to power-cycle the probe");
-        assert_eq!((cycle.attempt, cycle.off_ms), (1, 1_000));
-        assert!(!app.power_cycle_pending());
-        assert_eq!(app.recovery.power_cycles_total(), 1);
-
-        // VDD off for 1 s, probe re-initialised: it answers again about two seconds later.
-        ms += 2_500;
-        app.tick(ms);
-        assert!(app.raw_reading(22_100, ms), "the first valid reading ends the reset");
-        assert_eq!(app.status().sensor_reset_attempt, 0);
-        // Three good windows later heating resumes. A fault never shows on the way.
-        for window in 1..=3u64 {
-            ms = failed_at + 5_000 * window;
-            app.tick(ms);
-            assert_eq!(app.control.fault(), None);
-            if window < 3 {
-                assert_eq!(app.control.mode(), "standby");
-                assert_eq!(u64::from(app.control.recovery_samples()), window);
-                assert!(!app.tick(ms));
-                app.raw_reading(22_100, ms);
-            }
-        }
-        assert_eq!(app.control.mode(), "pid");
-        assert!(app.control.commanded_duty_pct(ms) > 0.0);
+        // The probe latches up: the first window without any reading closes 5 s later and the
+        // reset starts; the probe answers about 2.5 s after that.
+        let t = t0 + 5_000;
+        let (closed, cycles) = run(&mut app, &mut ms, t + 12_000, Some(t + 2_500), &|app, at| {
+            assert_eq!(app.control.fault(), None, "never a fault (at {at})");
+            assert_eq!(app.control.mode(), "pid", "heater stays in PID mode (at {at})");
+            assert!(app.control.commanded_duty_pct(at) > 0.0, "same duty all along (at {at})");
+            assert_eq!(app.status().start_blocked_by, None);
+        });
+        assert!(closed > 30, "the SSR keeps switching through the reset: {closed} closed ticks in 12 s");
+        // The reset really happened, and it is not shown as heater state: the probe is back and
+        // the next window carried it.
+        assert_eq!(cycles, [(1, 1_000)]);
+        assert_eq!((app.recovery.power_cycles_total(), app.recovery.recoveries_total()), (1, 1));
         assert_eq!(app.status().sensor, "ok");
         assert_eq!(app.temp_text(), "22.10 C");
-        assert_eq!((app.recovery.power_cycles_total(), app.recovery.recoveries_total()), (1, 1));
+        assert!(!app.control.holding_through_reset());
     }
 
     #[test]
-    fn a_later_reset_can_still_save_the_day_without_a_fault() {
+    fn reset_is_diagnostics_only_while_the_heater_rides_through() {
         let (mut app, mut ms) = running_app();
-        ms += 5_000;
-        app.tick(ms);
-        let t = ms;
-        assert_eq!(app.take_power_cycle().map(|c| c.attempt), Some(1));
-        // Reset 1 does not help; reset 2 (VDD off 3 s) starts after 1 s off + 6 s of waiting.
-        while ms < t + 7_000 { ms += 100; app.tick(ms); }
-        assert_eq!(app.status().sensor_reset_attempt, 2);
-        assert_eq!(app.take_power_cycle().map(|c| (c.attempt, c.off_ms)), Some((2, 3_000)));
-        assert_eq!(app.control.fault(), None);
-        ms += 4_000;
-        app.tick(ms);
-        assert!(app.raw_reading(22_000, ms));
-        assert_eq!(app.status().sensor_reset_attempt, 0);
-        assert_eq!(app.control.fault(), None);
-        assert_eq!(app.recovery.recoveries_total(), 1);
+        let until = ms + 5_100;
+        run(&mut app, &mut ms, until, None, &|_, _| {}); // first silent window closes
+        let status = app.status();
+        assert_eq!((status.sensor, status.sensor_reset_attempt, status.fault, status.mode), ("resetting", 1, None, "pid"));
+        assert_eq!(app.temp_text(), "22.00 C*");
+        assert!(app.control.holding_through_reset());
+        let m = app.metrics();
+        assert!(m.contains("birdburner_sensor_resetting 1\n") && m.contains("birdburner_mode{mode=\"pid\"} 1"));
+        assert!(m.contains("birdburner_fault{fault=\"none\"} 1"));
     }
 
     #[test]
-    fn dead_probe_is_a_fault_only_after_every_reset_failed_and_heals_later() {
+    fn a_later_reset_can_still_save_the_day_without_a_fault_or_a_stop() {
+        let (mut app, mut ms) = running_app();
+        let t = ms + 5_000;
+        // Reset 1 (VDD off 1 s) does not help; reset 2 (3 s) starts 7 s later and works.
+        let (closed, cycles) = run(&mut app, &mut ms, t + 20_000, Some(t + 11_000), &|app, at| {
+            assert_eq!(app.control.fault(), None, "never a fault (at {at})");
+            assert_eq!(app.control.mode(), "pid", "(at {at})");
+            assert!(app.control.commanded_duty_pct(at) > 0.0, "(at {at})");
+        });
+        assert!(closed > 50, "{closed}");
+        assert_eq!(app.status().sensor, "ok");
+        assert_eq!(app.recovery.recoveries_total(), 1);
+        assert_eq!(cycles, [(1, 1_000), (2, 3_000)]);
+    }
+
+    #[test]
+    fn dead_probe_heats_until_the_resets_fail_then_cuts_and_reports_the_fault() {
         let (mut app, mut ms) = running_app();
         let t = ms + 5_000; // the first window without a reading closes here
         let mut cycles = Vec::new();
+        let mut closed_during_ladder = 0;
         while ms < t + 160_000 {
             ms += 100;
             let heater_on = app.tick(ms);
-            if ms >= t { assert!(!heater_on, "no heating on a silent probe (at {ms})"); }
             if let Some(c) = app.take_power_cycle() { cycles.push((ms, c.attempt, c.off_ms)); }
             if ms < t + 32_000 {
                 assert_eq!(app.control.fault(), None, "still resetting, not a fault (at {ms})");
-            } else {
+                assert_eq!(app.control.mode(), "pid", "the heater keeps going until the last reset fails (at {ms})");
+                if heater_on { closed_during_ladder += 1; }
+            } else if ms > t + 32_100 {
+                assert!(!heater_on, "heater cut once the resets failed (at {ms})");
                 assert_eq!(app.control.fault().map(|f| f.label()), Some("sensor_error"), "at {ms}");
             }
         }
+        assert!(closed_during_ladder > 100, "{closed_during_ladder}");
         // 3 resets (1 s, 3 s, 10 s off); the fault is reported 32 s after the first failed window;
         // from then on the power cycle repeats once a minute without clearing the fault.
         assert_eq!(cycles, [(t, 1, 1_000), (t + 7_000, 2, 3_000), (t + 16_000, 3, 10_000),
@@ -275,6 +290,127 @@ mod tests {
         assert_eq!(app.control.fault(), None);
         assert_eq!(app.control.mode(), "pid");
         assert_eq!(app.recovery.recoveries_total(), 1);
+    }
+
+    #[test]
+    fn a_probe_reset_while_the_heater_is_off_shows_the_reset_and_keeps_it_off() {
+        let mut app = AppState::new(LIMITS, Settings::default()); // never started
+        app.sample(23_000, 0);
+        app.window_failed(5_000);
+        assert!(app.recovery.resetting());
+        assert_eq!(app.control.fault(), None);
+        assert!(!app.tick(5_100));
+        assert_eq!(app.status().sensor, "resetting");
+    }
+
+    #[test]
+    fn pid_gains_load_apply_and_persist() {
+        use super::http_api::gain_milli;
+        use super::heater_control::{KD_RANGE_MILLI, KI_RANGE_MILLI, KP_RANGE_MILLI};
+        let saved = Settings { kp_milli: 25_000, ki_milli: 40, kd_milli: 5_000, ..Settings::default() };
+        let mut app = AppState::new(LIMITS, saved);
+        assert_eq!(app.control.pid_gains_milli(), (25_000, 40, 5_000));
+        assert_eq!(app.settings(), saved);
+        assert!(!app.settings_dirty);
+        let st = app.status();
+        assert_eq!((st.pid_kp, st.pid_ki, st.pid_kd), (25.0, 0.04, 5.0));
+        let m = app.metrics();
+        assert!(m.contains("birdburner_pid_kp 25\n") && m.contains("birdburner_pid_ki 0.04\n") && m.contains("birdburner_pid_kd 5\n"));
+        // A change marks the settings dirty so the storage task writes them to flash.
+        assert!(app.mutate_gains(12_345, 2_000, 0));
+        assert!(app.settings_dirty);
+        assert_eq!((app.settings().kp_milli, app.settings().ki_milli, app.settings().kd_milli), (12_345, 2_000, 0));
+        // Rejected input changes nothing and writes nothing.
+        app.settings_dirty = false;
+        assert!(!app.mutate_gains(100_001, 0, 0));
+        assert!(!app.settings_dirty);
+        assert_eq!(app.control.pid_gains_milli(), (12_345, 2_000, 0));
+        // JSON numbers -> thousandths.
+        assert_eq!(gain_milli(10.0, KP_RANGE_MILLI), Some(10_000));
+        assert_eq!(gain_milli(0.1, KI_RANGE_MILLI), Some(100));
+        assert_eq!(gain_milli(0.0005, KI_RANGE_MILLI), Some(1), "rounds to the nearest 0.001");
+        assert_eq!(gain_milli(100.0, KP_RANGE_MILLI), Some(100_000));
+        assert_eq!(gain_milli(200.0, KD_RANGE_MILLI), Some(200_000));
+        for bad in [-0.001, 100.0001, 100.001, f64::NAN, f64::INFINITY, 1e300] {
+            assert_eq!(gain_milli(bad, KP_RANGE_MILLI), None, "{bad}");
+        }
+        assert_eq!(gain_milli(2.001, KI_RANGE_MILLI), None);
+    }
+
+    #[test]
+    fn flash_pending_covers_debounce_write_retry_and_changes_during_a_write() {
+        let mut app = AppState::new(LIMITS, Settings::default());
+        assert!(!app.status().settings_pending);
+        app.mutate_gains(11_000, 100, 0);
+        assert!(app.status().settings_pending, "dirty/debounce must not say saved");
+        let first = app.take_settings_to_save().unwrap();
+        assert!(!app.settings_dirty);
+        assert!(app.status().settings_pending, "write/read-back verification still pending");
+        assert_eq!(app.take_settings_to_save(), None, "cannot start a concurrent write");
+        app.finish_settings_save(false);
+        assert!(app.status().settings_pending);
+        assert!(!app.storage_ok);
+        assert_eq!(app.storage_failures_total, 1);
+        assert_eq!(app.take_settings_to_save(), Some(first));
+        app.mutate_gains(12_000, 100, 0); // another setting was applied before the write completed
+        app.finish_settings_save(true);
+        assert!(app.status().settings_pending, "the newer settings are not confirmed by the older save");
+        let second = app.take_settings_to_save().unwrap();
+        assert_eq!(second.kp_milli, 12_000);
+        app.finish_settings_save(true);
+        assert!(!app.status().settings_pending);
+        assert!(app.storage_ok);
+        assert_eq!(app.storage_writes_total, 3);
+        assert_eq!(app.take_settings_to_save(), None);
+    }
+
+    #[test]
+    fn reset_raw_read_to_average_transition_is_recovering_not_error() {
+        let (mut app, mut ms) = running_app();
+        ms += 5_000;
+        app.tick(ms);
+        app.take_power_cycle();
+        assert_eq!(app.status().sensor, "resetting");
+        assert!(app.raw_reading(22_100, ms + 2_000));
+        assert_eq!(app.status().sensor, "recovering", "valid raw sample arrived; average still pending");
+        assert_eq!(app.status().fault, None);
+        assert_eq!(app.status().mode, "pid");
+        assert_eq!(app.temperature_mc, None, "never fabricate a current temperature from the cache");
+        app.tick(ms + 5_000);
+        assert_eq!(app.status().sensor, "ok");
+        assert!(!app.status().heater_output_held);
+    }
+
+    #[test]
+    fn an_empty_window_interrupts_consecutive_good_windows_even_after_resets_failed() {
+        let (mut app, mut ms) = running_app();
+        let end = ms + 50_000;
+        while ms < end { ms += 100; app.tick(ms); app.take_power_cycle(); }
+        assert_eq!(app.control.fault().map(|f| f.label()), Some("sensor_error"));
+        app.raw_reading(22_000, ms);
+        app.tick(ms + 5_000);
+        assert_eq!(app.control.recovery_samples(), 1);
+        app.raw_reading(22_000, ms + 5_000);
+        app.tick(ms + 10_000);
+        assert_eq!(app.control.recovery_samples(), 2);
+        app.tick(ms + 15_000); // no good raw read in this window
+        assert_eq!(app.control.recovery_samples(), 0, "must require consecutive, not accumulated good windows");
+        app.raw_reading(22_000, ms + 15_000);
+        app.tick(ms + 20_000);
+        assert_eq!(app.control.recovery_samples(), 1);
+        assert_eq!(app.control.mode(), "fault");
+    }
+
+    #[test]
+    fn a_valid_raw_overtemperature_during_reset_cuts_heat_before_averaging() {
+        let (mut app, mut ms) = running_app();
+        ms += 5_000;
+        app.tick(ms);
+        app.take_power_cycle();
+        app.raw_reading(36_000, ms + 2_000);
+        assert_eq!(app.control.fault().map(|f| f.label()), Some("over_temperature"));
+        assert!(!app.tick(ms + 2_001));
+        assert_eq!(app.control.commanded_duty_pct(ms + 2_001), 0.0);
     }
 }
 

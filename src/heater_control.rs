@@ -6,11 +6,22 @@ pub const PWM_WINDOW_MS: u64 = 2000;
 pub const SAMPLE_WINDOW_MS: u64 = 5000;
 /// A control sample older than this cuts the heater (more than two windows).
 pub const SENSOR_MAX_AGE_MS: u64 = 12_000;
+/// Absolute age limit even while probe recovery holds output; never renewed by reset attempts.
+/// Normally the 32 s reset ladder gives up earlier. This guard also covers a stalled supervisor.
+pub const SENSOR_RESET_MAX_AGE_MS: u64 = 45_000;
 pub const MIN_AC_PULSE_MS: u64 = 20;
 pub const SENSOR_RECOVERY_SAMPLES: u8 = 3;
 /// User-adjustable maximum heater duty (whole percent).
 pub const MAX_OUTPUT_RANGE_PCT: core::ops::RangeInclusive<u8> = 10..=100;
 pub const DEFAULT_MAX_OUTPUT_PCT: u8 = 100;
+/// PID gains are stored and exchanged in thousandths. Kp: percent / C, Ki: percent / (C * s),
+/// Kd: percent * s / C. Defaults are provisional (not tuned on this cage).
+pub const DEFAULT_KP_MILLI: u32 = 10_000;
+pub const DEFAULT_KI_MILLI: u32 = 100;
+pub const DEFAULT_KD_MILLI: u32 = 0;
+pub const KP_RANGE_MILLI: core::ops::RangeInclusive<u32> = 0..=100_000;
+pub const KI_RANGE_MILLI: core::ops::RangeInclusive<u32> = 0..=2_000;
+pub const KD_RANGE_MILLI: core::ops::RangeInclusive<u32> = 0..=200_000;
 
 #[derive(Clone, Copy)]
 pub struct PidConfig {
@@ -24,7 +35,7 @@ impl Default for PidConfig {
     fn default() -> Self {
         // Gains are provisional (not tuned on this cage). The output limit is
         // only the first-boot default; the user can change it from the web page.
-        Self { kp: 10.0, ki: 0.1, kd: 0.0, output_limit_pct: DEFAULT_MAX_OUTPUT_PCT as f64 }
+        Self { kp: DEFAULT_KP_MILLI as f64 / 1000.0, ki: DEFAULT_KI_MILLI as f64 / 1000.0, kd: DEFAULT_KD_MILLI as f64 / 1000.0, output_limit_pct: DEFAULT_MAX_OUTPUT_PCT as f64 }
     }
 }
 
@@ -105,6 +116,21 @@ impl Pid {
     }
 
     pub fn output_limit_pct(&self) -> f64 { self.config.output_limit_pct }
+
+    pub fn gains_milli(&self) -> (u32, u32, u32) {
+        // Validated non-negative gains: adding half then truncating rounds without std/libm.
+        let m = |v: f64| (v * 1000.0 + 0.5) as u32;
+        (m(self.config.kp), m(self.config.ki), m(self.config.kd))
+    }
+
+    /// Takes effect at the next sample. Retains the integral except when integral action is
+    /// disabled (Ki=0), so turning off I cannot leave a hidden residual output.
+    pub fn set_gains_milli(&mut self, kp: u32, ki: u32, kd: u32) {
+        self.config.kp = kp as f64 / 1000.0;
+        self.config.ki = ki as f64 / 1000.0;
+        self.config.kd = kd as f64 / 1000.0;
+        if ki == 0 { self.integral = 0.0; }
+    }
 
     /// Lowering the limit also clamps the integral so the cap applies at once.
     pub fn set_output_limit(&mut self, pct: f64) {
@@ -217,8 +243,9 @@ pub struct HeaterControl {
     fault: Option<Fault>,
     desired_enabled: bool,
     recovery_samples: u8,
-    /// A probe reset is bridging a short gap: the PID integral is kept (see `sensor_resetting`).
-    pid_hold: bool,
+    /// The probe is being power-cycled and the heater keeps running on its last output
+    /// (see `sensor_resetting`).
+    probe_resetting: bool,
 }
 
 /// Over-temperature clears only once the cage is this far below the cutoff
@@ -239,7 +266,7 @@ impl HeaterControl {
             pid: Pid::new(config), pwm: WindowPwm::new(PWM_WINDOW_MS), limits,
             target_mc: 25_000, last_sample: None, output_pct: None,
             enabled: false, stopped: false, fault: None,
-            desired_enabled: false, recovery_samples: 0, pid_hold: false,
+            desired_enabled: false, recovery_samples: 0, probe_resetting: false,
         }
     }
 
@@ -277,7 +304,7 @@ impl HeaterControl {
         if !TARGET_RANGE_MC.contains(&target_mc) || target_mc % STEP_MC != 0 { return false; }
         if self.limits.is_some_and(|limits| target_mc + TARGET_MARGIN_MC > limits.max_temperature_mc) { return false; }
         self.target_mc = target_mc;
-        self.reset_pid();
+        self.pid.reset();
         self.output_pct = None; // wait for the NEXT fresh sample; never resume
         true
     }
@@ -295,24 +322,14 @@ impl HeaterControl {
         true
     }
 
-    /// Full PID reset: integral and previous sample gone, no pending hold.
-    fn reset_pid(&mut self) {
-        self.pid.reset();
-        self.pid_hold = false;
-    }
-
-    /// Heater off at once; recovery progress starts from scratch. The PID is reset unless
-    /// `keep_pid` (a probe reset bridging a short gap).
-    fn cut_heater_keeping(&mut self, keep_pid: bool) {
+    /// Heater off at once; PID and recovery progress start from scratch.
+    fn cut_heater(&mut self) {
         self.recovery_samples = 0;
         self.enabled = false;
         self.output_pct = None;
-        if keep_pid { self.pid.hold(); self.pid_hold = true; } else { self.reset_pid(); }
+        self.probe_resetting = false;
+        self.pid.reset();
         self.pwm.command(0, 0.0, false);
-    }
-
-    fn cut_heater(&mut self) {
-        self.cut_heater_keeping(false);
     }
 
     fn trip(&mut self, fault: Fault) {
@@ -322,27 +339,51 @@ impl HeaterControl {
 
     pub fn sensor_error(&mut self) {
         self.last_sample = None;
-        self.trip(Fault::SensorError);
+        // Probe recovery must not replace e.g. an over-temperature fault and lose its hysteresis.
+        if self.fault.is_none() { self.trip(Fault::SensorError); } else { self.cut_heater(); }
     }
 
-    /// The sensor stopped answering and a hardware reset (power cycle) is being tried. Cuts the
-    /// heater like `sensor_error` (no reading is trusted) but raises NO fault: the reset usually
-    /// brings the probe back within seconds, and `sample` then resumes heating after the usual
-    /// 3 good windows. The user's on/off choice and any fault already active are left alone.
-    ///
-    /// The PID integral (the learned steady-state output) is KEPT while the heater was running,
-    /// so a reset does not make the temperature sag while the integral rebuilds. It is only
-    /// bridged for the length of the reset ladder (about 32 s plus 3 windows): if the reset
-    /// fails the caller escalates to `sensor_error`, which wipes it, as does any fault, stop,
-    /// start or target change. No reading arrives meanwhile, so nothing is integrated.
+    /// The sensor stopped answering and a hardware reset (power cycle) is being tried. This is
+    /// NOT a fault and, while the heater is running, not even an interruption: the heater keeps
+    /// going on its last PID output (same duty, same PWM windows) and the integral is kept, so
+    /// output is unchanged. No reading arrives meanwhile, so a new over-temperature cannot be
+    /// detected. The reset ladder normally gives up after 32 s; an independent 45 s measurement
+    /// age guard also bounds this hold, even if the supervisor stalls. Either cuts the heater
+    /// and wipes the PID. The first valid control sample ends the
+    /// hold. If the heater was not running (standby, stopped, already faulted) the reset just
+    /// holds it off as before; the user's on/off choice and any active fault are left alone.
     pub fn sensor_resetting(&mut self) {
+        if self.enabled && self.fault.is_none() && self.last_sample.is_some() {
+            self.probe_resetting = true;
+            return;
+        }
         self.last_sample = None;
-        let keep = self.fault.is_none() && (self.enabled || self.pid_hold);
-        self.cut_heater_keeping(keep);
+        self.cut_heater();
     }
 
-    /// PID integral term in percent (diagnostics and tests).
+    /// The heater is running on its last output while the probe is being reset.
+    pub fn holding_through_reset(&self) -> bool { self.probe_resetting }
+
+    /// PID integral term in percent (test inspection only; not persisted).
+    #[cfg(test)]
     pub fn pid_integral_pct(&self) -> f64 { self.pid.integral }
+
+    /// A fresh raw reading during recovery can cut an over-temperature immediately without
+    /// treating the display cache or a single raw read as a PID control sample.
+    pub fn recovery_raw_reading(&mut self, temperature_mc: i32) {
+        if self.probe_resetting && self.limits.is_some_and(|l| temperature_mc >= l.max_temperature_mc) {
+            self.trip(Fault::OverTemperature);
+        }
+    }
+
+    pub fn pid_gains_milli(&self) -> (u32, u32, u32) { self.pid.gains_milli() }
+
+    /// Change the PID gains (thousandths); rejected when out of range.
+    pub fn set_pid_gains(&mut self, kp: u32, ki: u32, kd: u32) -> bool {
+        if !KP_RANGE_MILLI.contains(&kp) || !KI_RANGE_MILLI.contains(&ki) || !KD_RANGE_MILLI.contains(&kd) { return false; }
+        self.pid.set_gains_milli(kp, ki, kd);
+        true
+    }
 
     /// After a power cut: heater off, no measurement carried over, resume the
     /// saved on/off choice once fresh readings arrive.
@@ -362,6 +403,9 @@ impl HeaterControl {
             self.trip(Fault::InvalidSample);
             return;
         }
+        if self.probe_resetting && self.last_sample.is_some_and(|(ms, _)| now_ms.saturating_sub(ms) >= SENSOR_RESET_MAX_AGE_MS) {
+            self.trip(Fault::SensorStale); // a late sample must not bypass the hold deadline
+        }
         self.last_sample = Some((now_ms, temperature_mc));
         if let Some(limits) = self.limits {
             if temperature_mc >= limits.max_temperature_mc {
@@ -374,12 +418,17 @@ impl HeaterControl {
                 return;
             }
         }
+        if self.probe_resetting {
+            // The probe answered again: the gap since the previous sample is not integrated.
+            self.probe_resetting = false;
+            self.pid.hold();
+        }
         let recovering = self.fault.is_some() || (self.desired_enabled && !self.enabled);
         if recovering {
             self.recovery_samples = self.recovery_samples.saturating_add(1);
             if self.recovery_samples < SENSOR_RECOVERY_SAMPLES { return; }
             self.fault = None;
-            if self.pid_hold { self.pid.hold(); self.pid_hold = false; } else { self.reset_pid(); }
+            self.pid.reset();
             self.output_pct = None;
             if self.desired_enabled && self.safety_configured() {
                 // Automatic recovery does not require temperature below target:
@@ -414,24 +463,28 @@ impl HeaterControl {
         self.recovery_samples = 0;
         self.enabled = true;
         self.output_pct = None; // start OFF, wait for a new successful conversion
-        self.reset_pid();
+        self.pid.reset();
         self.pwm.command(now_ms, 0.0, false);
         Ok(())
     }
 
     pub fn stop(&mut self) {
+        if self.probe_resetting { self.last_sample = None; } // nothing left to hold or to go stale
+        self.probe_resetting = false;
         self.enabled = false;
         self.desired_enabled = false;
         self.recovery_samples = 0;
         self.stopped = true;
-        self.reset_pid();
+        self.pid.reset();
         self.output_pct = None;
         self.pwm.command(0, 0.0, false);
     }
 
     fn desired_duty_pct(&self, now_ms: u64) -> f64 {
         if !self.enabled || self.fault.is_some() { return 0.0; }
-        if !self.last_sample.is_some_and(|(ms, _)| now_ms >= ms && now_ms - ms < SENSOR_MAX_AGE_MS) { return 0.0; }
+        let max_age = if self.probe_resetting { SENSOR_RESET_MAX_AGE_MS } else { SENSOR_MAX_AGE_MS };
+        let fresh = |(ms, _): (u64, i32)| now_ms >= ms && now_ms - ms < max_age;
+        if !self.last_sample.is_some_and(fresh) { return 0.0; }
         self.output_pct.unwrap_or(0.0)
     }
 
@@ -443,9 +496,12 @@ impl HeaterControl {
 
     /// Call every loop. Safety override does not wait for a PWM boundary.
     pub fn tick(&mut self, now_ms: u64) -> bool {
-        if self.last_sample.is_some_and(|(ms, _)| now_ms < ms || now_ms - ms >= SENSOR_MAX_AGE_MS) {
-            self.last_sample = None;
-            self.trip(Fault::SensorStale);
+        if let Some((ms, _)) = self.last_sample {
+            let max_age = if self.probe_resetting { SENSOR_RESET_MAX_AGE_MS } else { SENSOR_MAX_AGE_MS };
+            if now_ms < ms || now_ms - ms >= max_age {
+                self.last_sample = None;
+                if self.fault.is_none() { self.trip(Fault::SensorStale); }
+            }
         }
         let duty = self.desired_duty_pct(now_ms);
         self.pwm.command(now_ms, duty, self.enabled && self.fault.is_none())
@@ -577,30 +633,6 @@ mod tests {
         assert!(control.tick(3000));
     }
 
-    #[test]
-    fn sensor_reset_cuts_heat_without_a_fault_and_resumes_after_three_good_samples() {
-        let mut control = configured();
-        control.sample(20_000, 0);
-        control.start(0).unwrap();
-        control.sample(20_000, 1000);
-        assert!(control.tick(1000));
-        control.sensor_resetting();
-        assert!(!control.tick(1001), "heater cut at once");
-        assert_eq!(control.fault(), None, "a reset in progress is not a fault");
-        assert_eq!(control.mode(), "standby");
-        assert!(control.desired_enabled(), "the user's on choice is kept");
-        assert_eq!(control.commanded_duty_pct(1001), 0.0);
-        assert_eq!(control.check_start(1001), Err(StartError::SensorNotReady));
-        control.sample(20_000, 2000);
-        control.sample(20_000, 3000);
-        assert!(!control.tick(3000));
-        assert_eq!(control.recovery_samples(), 2);
-        assert_eq!(control.fault(), None);
-        control.sample(20_000, 4000);
-        assert_eq!(control.mode(), "pid");
-        assert!(control.tick(4000));
-    }
-
     /// Heating at 20 C towards 25 C: returns the control after `n` 5 s samples (integral built up).
     fn heating_with_integral(n: u64) -> (HeaterControl, u64) {
         let mut control = configured();
@@ -611,75 +643,225 @@ mod tests {
         (control, ms)
     }
 
+    /// Runs `tick` every 100 ms from `from` to `to`; returns how many ticks had the SSR closed.
+    fn run_ticks(control: &mut HeaterControl, from: u64, to: u64) -> (u64, u64) {
+        let (mut on, mut total) = (0, 0);
+        let mut ms = from;
+        while ms < to { ms += 100; total += 1; if control.tick(ms) { on += 1; } }
+        (on, total)
+    }
+
     #[test]
-    fn probe_reset_keeps_the_pid_integral_so_heating_resumes_where_it_left_off() {
+    fn probe_reset_keeps_the_heater_running_without_a_fault() {
+        let (mut control, ms) = heating_with_integral(8);
+        let duty = control.commanded_duty_pct(ms);
+        let before = control.pid_output_pct().unwrap();
+        run_ticks(&mut control, ms, ms + 2_000);
+        assert!(before > 50.0 && control.commanded_duty_pct(ms + 2_000) > 0.0 && duty == 0.0);
+
+        control.sensor_resetting();
+        assert!(control.holding_through_reset());
+        assert_eq!(control.fault(), None, "a reset in progress is not a fault");
+        assert_eq!(control.mode(), "pid", "nothing changes for the user");
+        assert_eq!(control.pid_output_pct(), Some(before), "same output");
+        // 40 s without a sample (the whole ladder, far beyond the usual 12 s) and the SSR keeps
+        // switching at the same duty: duty = commanded on-time / window.
+        let (on, total) = run_ticks(&mut control, ms + 2_000, ms + 42_000);
+        assert_eq!(control.fault(), None);
+        assert_eq!(control.mode(), "pid");
+        let ratio = on as f64 / total as f64 * 100.0;
+        assert!((ratio - control.commanded_duty_pct(ms + 42_000)).abs() < 5.0, "ratio {ratio}");
+        assert!(ratio > 20.0, "the heater really keeps heating: {ratio}");
+    }
+
+    #[test]
+    fn reset_preserves_every_pwm_edge_and_cannot_extend_the_hold_deadline() {
+        let (mut control, ms) = heating_with_integral(8);
+        control.tick(ms);
+        let output = control.pid_output_pct().unwrap();
+        let mut expected = WindowPwm {
+            window_start_ms: control.pwm.window_start_ms,
+            latched_on_ms: control.pwm.latched_on_ms,
+            window_ms: PWM_WINDOW_MS,
+        };
+        control.sensor_resetting();
+        for age in (5..SENSOR_RESET_MAX_AGE_MS).step_by(5) {
+            if age == 7_000 || age == 16_000 { control.sensor_resetting(); }
+            assert_eq!(control.tick(ms + age), expected.command(ms + age, output, true), "PWM edge at {age}");
+            assert_eq!(control.fault(), None);
+        }
+        assert_eq!(control.commanded_duty_pct(ms + SENSOR_RESET_MAX_AGE_MS), 0.0, "read-only duty also enforces age limit");
+        assert!(!control.tick(ms + SENSOR_RESET_MAX_AGE_MS));
+        assert_eq!(control.fault(), Some(Fault::SensorStale));
+        assert_eq!(control.pid_integral_pct(), 0.0);
+        control.sensor_resetting();
+        assert!(!control.tick(ms + SENSOR_RESET_MAX_AGE_MS + 1_000), "another reset cannot re-arm heating");
+    }
+
+    #[test]
+    fn a_late_sample_and_reversed_clock_cannot_bypass_recovery_deadline() {
+        let (mut control, ms) = heating_with_integral(8);
+        control.sensor_resetting();
+        control.sample(20_000, ms + SENSOR_RESET_MAX_AGE_MS);
+        assert_eq!(control.fault(), Some(Fault::SensorStale));
+        assert_eq!(control.recovery_samples(), 1);
+        assert!(!control.tick(ms + SENSOR_RESET_MAX_AGE_MS));
+        let (mut control, ms) = heating_with_integral(8);
+        control.sensor_resetting();
+        assert!(!control.tick(ms - 1));
+        assert_eq!(control.fault(), Some(Fault::SensorStale));
+    }
+
+    #[test]
+    fn raw_overtemperature_during_recovery_and_failed_reset_keep_hysteresis() {
+        let (mut control, ms) = heating_with_integral(8);
+        control.sensor_resetting();
+        control.recovery_raw_reading(41_000);
+        assert_eq!(control.fault(), Some(Fault::OverTemperature));
+        assert!(!control.tick(ms + 1));
+        control.sensor_error();
+        assert_eq!(control.fault(), Some(Fault::OverTemperature));
+        for age in [5_000, 10_000, 15_000] { control.sample(38_000, ms + age); }
+        assert_eq!(control.fault(), Some(Fault::OverTemperature), "38 C is above the 37 C recovery threshold");
+        control.tick(ms + 30_000);
+        assert_eq!(control.fault(), Some(Fault::OverTemperature), "staleness must not erase hysteresis either");
+    }
+
+    #[test]
+    fn disabling_integral_action_clears_residual_heat() {
+        let (mut control, ms) = heating_with_integral(8);
+        assert!(control.pid_integral_pct() > 10.0);
+        assert!(control.set_pid_gains(0, 0, 0));
+        assert_eq!(control.pid_integral_pct(), 0.0);
+        control.sample(20_000, ms + 5_000);
+        assert_eq!(control.pid_output_pct(), Some(0.0));
+        assert!(!control.tick(ms + 5_000));
+    }
+
+    #[test]
+    fn first_sample_after_the_reset_resumes_control_with_the_integral_kept() {
         let (mut control, mut ms) = heating_with_integral(8);
         let integral = control.pid_integral_pct();
         assert!(integral > 10.0, "integral built up: {integral}");
         let before = control.pid_output_pct().unwrap();
-
         control.sensor_resetting();
-        assert_eq!(control.fault(), None);
-        assert!(!control.tick(ms + 1));
-        assert_eq!(control.pid_integral_pct(), integral, "the integral survives the reset");
-        // A second reset attempt in the same incident must not lose it either.
-        ms += 12_000;
-        control.sensor_resetting();
-        assert_eq!(control.pid_integral_pct(), integral);
-
-        // 3 good windows later heating resumes with the same integral, not from scratch.
-        for _ in 0..3 { ms += 5_000; control.sample(20_000, ms); }
+        run_ticks(&mut control, ms, ms + 30_000); // far beyond the usual 12 s
+        ms += 30_000;
+        control.sample(20_000, ms);
+        assert!(!control.holding_through_reset());
         assert_eq!(control.mode(), "pid");
+        assert_eq!(control.pid_integral_pct(), integral, "the gap itself is not integrated");
         let after = control.pid_output_pct().unwrap();
         assert!((after - before).abs() < 1.0, "output continues at {before}, got {after}");
-        assert!(after > 10.0 * 5.0 + 10.0, "P term alone is 50: the integral is still in there");
-        assert_eq!(control.pid_integral_pct(), integral, "the gap itself is not integrated");
+        // And normal 5 s control goes on from there.
+        ms += 5_000;
+        control.sample(20_000, ms);
+        assert!(control.pid_integral_pct() > integral);
     }
 
     #[test]
-    fn failed_probe_reset_wipes_the_integral() {
-        let (mut control, mut ms) = heating_with_integral(8);
+    fn failed_probe_reset_cuts_the_heater_and_wipes_the_pid() {
+        let (mut control, ms) = heating_with_integral(8);
         assert!(control.pid_integral_pct() > 10.0);
         control.sensor_resetting();
+        run_ticks(&mut control, ms, ms + 30_000);
+        assert!(control.tick(ms + 30_000) || control.commanded_duty_pct(ms + 30_000) > 0.0, "still heating until the ladder gives up");
         control.sensor_error(); // every reset failed: now it is a fault
+        assert_eq!(control.fault(), Some(Fault::SensorError));
+        assert!(!control.tick(ms + 30_100));
+        assert_eq!(control.commanded_duty_pct(ms + 30_100), 0.0);
         assert_eq!(control.pid_integral_pct(), 0.0);
-        for _ in 0..3 { ms += 5_000; control.sample(20_000, ms); }
+        assert!(!control.holding_through_reset());
+        // Recovery as before: 3 good windows, PID from scratch (P term only).
+        let mut t = ms + 30_100;
+        for _ in 0..3 { t += 5_000; control.sample(20_000, t); }
         assert_eq!(control.mode(), "pid");
-        assert_eq!(control.pid_output_pct(), Some(50.0), "P only: nothing carried over from before the fault");
+        assert_eq!(control.pid_output_pct(), Some(50.0));
     }
 
     #[test]
-    fn integral_is_not_kept_unless_the_heater_was_running() {
-        // Standby, never heated: nothing to keep.
+    fn hold_does_not_outlive_a_user_action() {
+        for action in 0..2 {
+            let (mut control, ms) = heating_with_integral(8);
+            control.sensor_resetting();
+            if action == 0 { control.stop(); } else { control.sensor_error(); }
+            assert!(!control.holding_through_reset(), "action {action}");
+            assert_eq!(control.pid_integral_pct(), 0.0, "action {action}");
+            assert!(!control.tick(ms + 30_000), "no heating on a stale sample after action {action}");
+        }
+        // A new target during the reset starts the PID clean and keeps the heater off until the
+        // next sample, without turning the reset into a fault.
+        let (mut control, ms) = heating_with_integral(8);
+        control.sensor_resetting();
+        assert!(control.set_target(26_000));
+        assert_eq!(control.pid_integral_pct(), 0.0);
+        assert!(!control.tick(ms + 30_000));
+        assert_eq!(control.fault(), None);
+    }
+
+    #[test]
+    fn reset_while_not_heating_holds_the_heater_off_without_a_fault() {
         let mut control = configured();
         control.sample(20_000, 0);
+        control.sensor_resetting(); // never started: nothing to hold
+        assert!(!control.holding_through_reset());
+        assert_eq!(control.fault(), None);
+        assert_eq!(control.mode(), "standby");
+        assert_eq!(control.pid_integral_pct(), 0.0);
+        // Armed but waiting for 3 good windows (e.g. just after a boot): stays off.
+        let mut control = configured();
+        control.restore_desired(true);
+        control.sample(20_000, 0);
         control.sensor_resetting();
-        assert_eq!(control.pid_integral_pct(), 0.0);
-        // A fault that is already active is not softened by a reset.
-        let (mut control, ms) = heating_with_integral(8);
-        control.sample(41_000, ms + 5_000);
-        assert_eq!(control.fault(), Some(Fault::OverTemperature));
-        assert_eq!(control.pid_integral_pct(), 0.0);
-        control.sensor_resetting();
-        assert_eq!(control.pid_integral_pct(), 0.0);
-        // Stop, start and a new target start clean even after a reset.
-        let (mut control, _) = heating_with_integral(8);
-        control.sensor_resetting();
-        control.set_target(26_000);
-        assert_eq!(control.pid_integral_pct(), 0.0);
-        let (mut control, _) = heating_with_integral(8);
-        control.sensor_resetting();
-        control.stop();
-        assert_eq!(control.pid_integral_pct(), 0.0);
+        assert_eq!(control.mode(), "standby");
+        assert!(!control.tick(1000));
+        for ms in [5_000, 10_000, 15_000] { control.sample(20_000, ms); }
+        assert_eq!(control.mode(), "pid");
     }
 
     #[test]
     fn temperature_above_target_after_the_reset_drops_the_integral() {
         let (mut control, mut ms) = heating_with_integral(8);
         control.sensor_resetting();
-        for _ in 0..3 { ms += 5_000; control.sample(26_000, ms); } // warmed up meanwhile
+        ms += 20_000;
+        control.sample(26_000, ms); // warmed up meanwhile
         assert_eq!(control.pid_output_pct(), Some(0.0));
         assert_eq!(control.pid_integral_pct(), 0.0, "no heat demanded above target");
+    }
+
+    #[test]
+    fn over_temperature_after_the_reset_still_trips() {
+        let (mut control, mut ms) = heating_with_integral(8);
+        control.sensor_resetting();
+        ms += 20_000;
+        control.sample(41_000, ms);
+        assert_eq!(control.fault(), Some(Fault::OverTemperature));
+        assert!(!control.tick(ms + 1));
+        assert!(!control.holding_through_reset());
+    }
+
+    #[test]
+    fn pid_gains_are_validated_and_applied() {
+        let mut control = configured();
+        assert_eq!(control.pid_gains_milli(), (DEFAULT_KP_MILLI, DEFAULT_KI_MILLI, DEFAULT_KD_MILLI));
+        for bad in [(100_001, 100, 0), (10_000, 2_001, 0), (10_000, 100, 200_001)] {
+            assert!(!control.set_pid_gains(bad.0, bad.1, bad.2), "{bad:?}");
+        }
+        assert_eq!(control.pid_gains_milli(), (10_000, 100, 0), "rejected values change nothing");
+        assert!(control.set_pid_gains(20_000, 0, 0));
+        assert_eq!(control.pid_gains_milli(), (20_000, 0, 0));
+        control.sample(20_000, 0);
+        control.start(0).unwrap();
+        control.sample(20_000, 5_000);
+        control.sample(20_000, 10_000);
+        assert_eq!(control.pid_output_pct(), Some(100.0), "Kp 20 x 5 C = 100%, no integral at Ki 0");
+        assert!(control.set_pid_gains(1_500, 0, 0));
+        control.sample(20_000, 15_000);
+        assert_eq!(control.pid_output_pct(), Some(7.5), "the new gain applies at the next sample");
+        assert!(control.set_pid_gains(0, 0, 0));
+        control.sample(20_000, 20_000);
+        assert_eq!(control.pid_output_pct(), Some(0.0));
+        assert!(control.set_pid_gains(100_000, 2_000, 200_000), "range limits are inclusive");
     }
 
     #[test]
