@@ -69,6 +69,7 @@ A **5 s window without a single valid reading** is the trigger (isolated bad rea
 
 - The **first valid reading ends the sequence**; the heater then resumes after 3 good 5 s windows (`resuming 1/3`, `2/3`, then PID). When the first reset works, heating is back roughly 15 s after the silent window was detected, and the heater stays off the whole time.
 - While resetting, the temperature line keeps the last good value with a `*`.
+- **The PID integral is kept** across a reset that works (the heater was running), so heating resumes at the output it had learned instead of ramping up from zero and letting the cage sag. Nothing is integrated during the gap. If the resets fail (`sensor_error`), or on any other fault, stop, start or target change, the PID starts from scratch as before.
 - Only if all three resets fail is `sensor_error` raised (about 32 s after the first silent window). The power cycle then **repeats once a minute** (VDD off 3 s) without clearing the fault, so a probe that comes back (re-plugged, power glitch) recovers by itself.
 - Each power cycle holds DATA low together with VDD. Otherwise the pull-ups would feed the chip through its input protection diode and a latched probe would never lose power.
 - The reset needs no network and runs even while the page is unreachable. A manual **Stop** is kept through a reset; the on/off choice is never changed.

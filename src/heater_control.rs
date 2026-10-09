@@ -97,6 +97,13 @@ impl Pid {
         self.previous_sample = None;
     }
 
+    /// Bridge a short measurement gap: keep the integral (the learned steady-state output) but
+    /// forget the previous sample, so the gap is neither integrated nor turned into a derivative
+    /// kick, and `update` does not treat it as a gap that wipes the integral.
+    pub fn hold(&mut self) {
+        self.previous_sample = None;
+    }
+
     pub fn output_limit_pct(&self) -> f64 { self.config.output_limit_pct }
 
     /// Lowering the limit also clamps the integral so the cap applies at once.
@@ -210,6 +217,8 @@ pub struct HeaterControl {
     fault: Option<Fault>,
     desired_enabled: bool,
     recovery_samples: u8,
+    /// A probe reset is bridging a short gap: the PID integral is kept (see `sensor_resetting`).
+    pid_hold: bool,
 }
 
 /// Over-temperature clears only once the cage is this far below the cutoff
@@ -230,7 +239,7 @@ impl HeaterControl {
             pid: Pid::new(config), pwm: WindowPwm::new(PWM_WINDOW_MS), limits,
             target_mc: 25_000, last_sample: None, output_pct: None,
             enabled: false, stopped: false, fault: None,
-            desired_enabled: false, recovery_samples: 0,
+            desired_enabled: false, recovery_samples: 0, pid_hold: false,
         }
     }
 
@@ -268,7 +277,7 @@ impl HeaterControl {
         if !TARGET_RANGE_MC.contains(&target_mc) || target_mc % STEP_MC != 0 { return false; }
         if self.limits.is_some_and(|limits| target_mc + TARGET_MARGIN_MC > limits.max_temperature_mc) { return false; }
         self.target_mc = target_mc;
-        self.pid.reset();
+        self.reset_pid();
         self.output_pct = None; // wait for the NEXT fresh sample; never resume
         true
     }
@@ -286,13 +295,24 @@ impl HeaterControl {
         true
     }
 
-    /// Heater off at once; PID and recovery progress start from scratch.
-    fn cut_heater(&mut self) {
+    /// Full PID reset: integral and previous sample gone, no pending hold.
+    fn reset_pid(&mut self) {
+        self.pid.reset();
+        self.pid_hold = false;
+    }
+
+    /// Heater off at once; recovery progress starts from scratch. The PID is reset unless
+    /// `keep_pid` (a probe reset bridging a short gap).
+    fn cut_heater_keeping(&mut self, keep_pid: bool) {
         self.recovery_samples = 0;
         self.enabled = false;
         self.output_pct = None;
-        self.pid.reset();
+        if keep_pid { self.pid.hold(); self.pid_hold = true; } else { self.reset_pid(); }
         self.pwm.command(0, 0.0, false);
+    }
+
+    fn cut_heater(&mut self) {
+        self.cut_heater_keeping(false);
     }
 
     fn trip(&mut self, fault: Fault) {
@@ -306,15 +326,23 @@ impl HeaterControl {
     }
 
     /// The sensor stopped answering and a hardware reset (power cycle) is being tried. Cuts the
-    /// heater exactly like `sensor_error` (no reading is trusted, PID restarts from scratch) but
-    /// raises NO fault: the reset usually brings the probe back within seconds, and `sample`
-    /// then resumes heating after the usual 3 good windows. The user's on/off choice and any
-    /// fault already active are left alone. If the reset fails the caller escalates to
-    /// `sensor_error`.
+    /// heater like `sensor_error` (no reading is trusted) but raises NO fault: the reset usually
+    /// brings the probe back within seconds, and `sample` then resumes heating after the usual
+    /// 3 good windows. The user's on/off choice and any fault already active are left alone.
+    ///
+    /// The PID integral (the learned steady-state output) is KEPT while the heater was running,
+    /// so a reset does not make the temperature sag while the integral rebuilds. It is only
+    /// bridged for the length of the reset ladder (about 32 s plus 3 windows): if the reset
+    /// fails the caller escalates to `sensor_error`, which wipes it, as does any fault, stop,
+    /// start or target change. No reading arrives meanwhile, so nothing is integrated.
     pub fn sensor_resetting(&mut self) {
         self.last_sample = None;
-        self.cut_heater();
+        let keep = self.fault.is_none() && (self.enabled || self.pid_hold);
+        self.cut_heater_keeping(keep);
     }
+
+    /// PID integral term in percent (diagnostics and tests).
+    pub fn pid_integral_pct(&self) -> f64 { self.pid.integral }
 
     /// After a power cut: heater off, no measurement carried over, resume the
     /// saved on/off choice once fresh readings arrive.
@@ -351,7 +379,7 @@ impl HeaterControl {
             self.recovery_samples = self.recovery_samples.saturating_add(1);
             if self.recovery_samples < SENSOR_RECOVERY_SAMPLES { return; }
             self.fault = None;
-            self.pid.reset();
+            if self.pid_hold { self.pid.hold(); self.pid_hold = false; } else { self.reset_pid(); }
             self.output_pct = None;
             if self.desired_enabled && self.safety_configured() {
                 // Automatic recovery does not require temperature below target:
@@ -386,7 +414,7 @@ impl HeaterControl {
         self.recovery_samples = 0;
         self.enabled = true;
         self.output_pct = None; // start OFF, wait for a new successful conversion
-        self.pid.reset();
+        self.reset_pid();
         self.pwm.command(now_ms, 0.0, false);
         Ok(())
     }
@@ -396,7 +424,7 @@ impl HeaterControl {
         self.desired_enabled = false;
         self.recovery_samples = 0;
         self.stopped = true;
-        self.pid.reset();
+        self.reset_pid();
         self.output_pct = None;
         self.pwm.command(0, 0.0, false);
     }
@@ -571,6 +599,87 @@ mod tests {
         control.sample(20_000, 4000);
         assert_eq!(control.mode(), "pid");
         assert!(control.tick(4000));
+    }
+
+    /// Heating at 20 C towards 25 C: returns the control after `n` 5 s samples (integral built up).
+    fn heating_with_integral(n: u64) -> (HeaterControl, u64) {
+        let mut control = configured();
+        control.sample(20_000, 0);
+        control.start(0).unwrap();
+        let mut ms = 0;
+        for _ in 0..n { ms += 5_000; control.sample(20_000, ms); }
+        (control, ms)
+    }
+
+    #[test]
+    fn probe_reset_keeps_the_pid_integral_so_heating_resumes_where_it_left_off() {
+        let (mut control, mut ms) = heating_with_integral(8);
+        let integral = control.pid_integral_pct();
+        assert!(integral > 10.0, "integral built up: {integral}");
+        let before = control.pid_output_pct().unwrap();
+
+        control.sensor_resetting();
+        assert_eq!(control.fault(), None);
+        assert!(!control.tick(ms + 1));
+        assert_eq!(control.pid_integral_pct(), integral, "the integral survives the reset");
+        // A second reset attempt in the same incident must not lose it either.
+        ms += 12_000;
+        control.sensor_resetting();
+        assert_eq!(control.pid_integral_pct(), integral);
+
+        // 3 good windows later heating resumes with the same integral, not from scratch.
+        for _ in 0..3 { ms += 5_000; control.sample(20_000, ms); }
+        assert_eq!(control.mode(), "pid");
+        let after = control.pid_output_pct().unwrap();
+        assert!((after - before).abs() < 1.0, "output continues at {before}, got {after}");
+        assert!(after > 10.0 * 5.0 + 10.0, "P term alone is 50: the integral is still in there");
+        assert_eq!(control.pid_integral_pct(), integral, "the gap itself is not integrated");
+    }
+
+    #[test]
+    fn failed_probe_reset_wipes_the_integral() {
+        let (mut control, mut ms) = heating_with_integral(8);
+        assert!(control.pid_integral_pct() > 10.0);
+        control.sensor_resetting();
+        control.sensor_error(); // every reset failed: now it is a fault
+        assert_eq!(control.pid_integral_pct(), 0.0);
+        for _ in 0..3 { ms += 5_000; control.sample(20_000, ms); }
+        assert_eq!(control.mode(), "pid");
+        assert_eq!(control.pid_output_pct(), Some(50.0), "P only: nothing carried over from before the fault");
+    }
+
+    #[test]
+    fn integral_is_not_kept_unless_the_heater_was_running() {
+        // Standby, never heated: nothing to keep.
+        let mut control = configured();
+        control.sample(20_000, 0);
+        control.sensor_resetting();
+        assert_eq!(control.pid_integral_pct(), 0.0);
+        // A fault that is already active is not softened by a reset.
+        let (mut control, ms) = heating_with_integral(8);
+        control.sample(41_000, ms + 5_000);
+        assert_eq!(control.fault(), Some(Fault::OverTemperature));
+        assert_eq!(control.pid_integral_pct(), 0.0);
+        control.sensor_resetting();
+        assert_eq!(control.pid_integral_pct(), 0.0);
+        // Stop, start and a new target start clean even after a reset.
+        let (mut control, _) = heating_with_integral(8);
+        control.sensor_resetting();
+        control.set_target(26_000);
+        assert_eq!(control.pid_integral_pct(), 0.0);
+        let (mut control, _) = heating_with_integral(8);
+        control.sensor_resetting();
+        control.stop();
+        assert_eq!(control.pid_integral_pct(), 0.0);
+    }
+
+    #[test]
+    fn temperature_above_target_after_the_reset_drops_the_integral() {
+        let (mut control, mut ms) = heating_with_integral(8);
+        control.sensor_resetting();
+        for _ in 0..3 { ms += 5_000; control.sample(26_000, ms); } // warmed up meanwhile
+        assert_eq!(control.pid_output_pct(), Some(0.0));
+        assert_eq!(control.pid_integral_pct(), 0.0, "no heat demanded above target");
     }
 
     #[test]

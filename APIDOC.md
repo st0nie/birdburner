@@ -75,6 +75,7 @@ Trigger: a 5 s window without a single valid reading. The heater is cut at that 
 - The **first valid reading** ends the sequence at any step. The heater stays off until 3 good windows have been collected (`recovery_samples` 1, 2, then `mode` returns to `pid`), so it resumes about 15 s after the silent window when the first reset works.
 - After giving up, the power cycle **repeats every 60 s** (VDD off 3 s) while the fault stays reported; a probe that comes back at any time clears it (first valid reading, then 3 good windows).
 - Each power cycle holds DATA low as well, so the pull-ups cannot keep the chip alive. If the probe is wired to 3V3 instead of GPIO22 the resets have no effect and the fault appears after the same ~32 s.
+- The PID integral is kept across a reset that works (only if the heater was running), so `pid_output_pct` resumes near its previous value once heating restarts. It is wiped when the resets fail (`sensor_error`), on any other fault, on stop/start and on a target change.
 - Manual **stop** and `desired_enabled` are never changed by a reset; `POST /api/start` during a reset is refused with `sensor_not_ready`.
 - Unlike the old behaviour, a silent probe now reaches `fault` ~32 s after the first silent window instead of immediately. The heater is off from the first silent window either way.
 
