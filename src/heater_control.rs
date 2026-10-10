@@ -187,11 +187,14 @@ impl Pid {
         let error = target_c - actual_c;
         let proportional = self.config.kp * error;
         let d_term = self.config.kd * derivative;
-        let candidate_i = (self.integral + self.config.ki * error * dt_s)
-            .clamp(0.0, self.config.output_limit_pct);
+        let integral_step = self.config.ki * error * dt_s;
+        let candidate_i = (self.integral + integral_step).clamp(0.0, self.config.output_limit_pct);
         let candidate_output = proportional + candidate_i + d_term;
-        // Conditional integration prevents windup at the output limits.
-        if (0.0..=self.config.output_limit_pct).contains(&candidate_output) {
+        // Direction-aware conditional integration: block only steps further into saturation.
+        // A corrective step is allowed even if P or D keeps the request outside the range.
+        let pushes_upper_limit = candidate_output > self.config.output_limit_pct && integral_step > 0.0;
+        let pushes_lower_limit = candidate_output < 0.0 && integral_step < 0.0;
+        if !pushes_upper_limit && !pushes_lower_limit {
             self.integral = candidate_i;
         }
         let output = proportional + self.integral + d_term;
@@ -200,8 +203,8 @@ impl Pid {
             return None;
         }
         // Heat-only guard: well above the target never heat. The integral is kept (it is the
-        // learned holding power) and bleeds down through the negative error while P+I+D still
-        // fits the output range; clearing it at the target caused the sawtooth seen on 2026-10-09.
+        // learned holding power); conditional integration can reduce it through negative error,
+        // but stops at lower saturation. Clearing it at the target caused the sawtooth seen on 2026-10-09.
         if -error >= HEAT_CUTOFF_ABOVE_TARGET_C { return Some(0.0); }
         Some(output.clamp(0.0, self.config.output_limit_pct))
     }
@@ -587,6 +590,78 @@ mod tests {
         for ms in (0..100_000).step_by(1000) { assert_eq!(pid.update(25.0, 10.0, ms), Some(30.0)); }
         assert_eq!(pid.integral, 0.0);
         assert!(pid.update(25.0, 24.9, 100_000).unwrap() < 2.0);
+    }
+
+    #[test]
+    fn conditional_integration_freezes_updates_further_into_upper_saturation() {
+        let mut pid = Pid::new(PidConfig { output_limit_pct: 30.0, ..legacy() });
+        pid.integral = 5.0;
+        // P=40, I=5: positive error would push the request further above the 30% cap.
+        for ms in (0..=60_000).step_by(5_000) {
+            assert_eq!(pid.update(25.0, 21.0, ms), Some(30.0));
+            assert_eq!(pid.integral, 5.0, "no windup at {ms}");
+        }
+    }
+
+    #[test]
+    fn conditional_integration_freezes_updates_further_into_lower_saturation() {
+        let mut pid = Pid::new(PidConfig { kp: 20.0, ki: 0.02, ..legacy() });
+        pid.integral = 4.0;
+        // P=-6, I=4: a negative integral step would only make the request more negative.
+        // Keeping I here is intentional clamping, not a reason to clear holding power.
+        for ms in (0..=3_600_000).step_by(5_000) {
+            assert_eq!(pid.update(25.0, 25.3, ms), Some(0.0));
+            assert_eq!(pid.integral, 4.0, "no forced integral decay at {ms}");
+        }
+    }
+
+    #[test]
+    fn conditional_integration_decreases_i_while_request_still_exceeds_upper_limit() {
+        let mut pid = Pid::new(PidConfig { kd: 100.0, output_limit_pct: 30.0, ..legacy() });
+        pid.integral = 10.0;
+        pid.update(25.0, 25.9, 0);
+        // Cooling 0.4 C/s gives D=40. Despite negative error and a decreasing I, the
+        // requested output stays above 30%. Do not block this direction of integration.
+        assert_eq!(pid.update(25.0, 25.5, 1_000), Some(30.0));
+        assert!((pid.integral - 9.95).abs() < 1e-9, "{}", pid.integral);
+        assert_eq!(pid.update(25.0, 25.1, 2_000), Some(30.0));
+        assert!((pid.integral - 9.94).abs() < 1e-9, "{}", pid.integral);
+        // Once D falls away, normal control resumes from the corrected integral.
+        let out = pid.update(25.0, 25.1, 3_000).unwrap();
+        assert!((out - 8.93).abs() < 1e-9, "{out}");
+    }
+
+    #[test]
+    fn conditional_integration_increases_i_while_request_still_below_lower_limit() {
+        let mut pid = Pid::new(PidConfig { kd: 100.0, ..legacy() });
+        pid.integral = 4.0;
+        pid.update(25.0, 24.0, 0);
+        // Warming 0.5 C in 5 s gives D=-10. P=5 and candidate I=4.25 still request
+        // -0.75%, but the positive integral step helps return towards the output range.
+        assert_eq!(pid.update(25.0, 24.5, 5_000), Some(0.0));
+        assert!((pid.integral - 4.25).abs() < 1e-9, "{}", pid.integral);
+        let out = pid.update(25.0, 24.5, 10_000).unwrap();
+        assert!((out - 9.5).abs() < 1e-9, "{out}");
+    }
+
+    #[test]
+    fn conditional_integration_accepts_exact_output_bounds_and_keeps_i_bounded() {
+        let cfg = PidConfig { kp: 0.0, ki: 1.0, output_limit_pct: 30.0, ..legacy() };
+        let mut pid = Pid::new(cfg);
+        pid.integral = 29.0;
+        assert_eq!(pid.update(25.0, 24.0, 0), Some(29.0));
+        assert_eq!(pid.update(25.0, 24.0, 1_000), Some(30.0));
+        assert_eq!(pid.integral, 30.0);
+        assert_eq!(pid.update(25.0, 24.0, 2_000), Some(30.0));
+        assert_eq!(pid.integral, 30.0, "the integral's own cap is unchanged");
+        assert_eq!(pid.update(25.0, 25.5, 3_000), Some(29.5));
+        let mut pid = Pid::new(cfg);
+        pid.integral = 0.5;
+        assert_eq!(pid.update(25.0, 25.5, 0), Some(0.5));
+        assert_eq!(pid.update(25.0, 25.5, 1_000), Some(0.0));
+        assert_eq!(pid.integral, 0.0);
+        assert_eq!(pid.update(25.0, 25.5, 2_000), Some(0.0));
+        assert_eq!(pid.integral, 0.0, "the integral cannot wind down below zero");
     }
 
     #[test]
